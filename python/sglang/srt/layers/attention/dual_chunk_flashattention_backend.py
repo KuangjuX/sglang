@@ -691,45 +691,96 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         chunk_size: int = 8192,
         local_size: int = 1024,
     ):
+        """
+        双块Flash Attention预填充函数
+        
+        该函数实现了双块注意力机制的预填充阶段,将长序列分成多个块进行处理。
+        支持稀疏注意力模式,可以处理超长上下文。
+        
+        参数说明:
+            q: 主查询张量 (total_tokens, num_heads, head_dim)
+            q_succ: 后继块查询张量,用于关注下一个块
+            q_inter: 中间块查询张量,用于关注非相邻块
+            q_succ_critical: 后继块的关键token查询
+            q_inter_critical: 中间块的关键token查询
+            k: 键张量,可能是完整的或分块的
+            v: 值张量,可能是完整的或分块的
+            cu_seqlens_q: 查询序列的累积长度 (batch_size+1,)
+            cu_seqlens_k: 键序列的累积长度 (batch_size+1,)
+            orig_seq_lens: 每个序列的原始长度列表
+            scaling_factor: 长度缩放因子,用于超长序列
+            softmax_scale: softmax的缩放因子
+            causal: 是否使用因果掩码(必须为True)
+            window_size: 滑动窗口大小(不支持,必须为(-1,-1))
+            block_table: 块表,用于分页KV缓存
+            chunk_size: 块大小,默认8192
+            local_size: 局部注意力窗口大小,默认1024
+        
+        返回:
+            torch.Tensor: 注意力输出 (total_tokens, num_heads, head_dim)
+        """
+        # 验证参数:双块注意力必须使用因果掩码
         if not causal:
             raise ValueError("Dual Chunk Attention does not support causal=False")
+        # 验证参数:不支持滑动窗口
         if window_size != (-1, -1):
             raise ValueError("Dual Chunk Attention does not support window_size")
 
+        # 将累积序列长度转换为CPU列表,便于Python循环处理
         cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
         cu_seqlens_k_cpu = cu_seqlens_k.cpu().tolist()
         all_outputs = []
 
+        # 遍历批次中的每个序列
         for i in range(0, len(cu_seqlens_q_cpu) - 1):
-            qs = cu_seqlens_q_cpu[i]
-            qe = cu_seqlens_q_cpu[i : i + 2][-1]
-            ks = cu_seqlens_k_cpu[i]
-            ke = cu_seqlens_k_cpu[i : i + 2][-1]
+            # 获取当前序列的查询起始和结束位置
+            # cu_seqlens_q 是累积查询序列长度数组,形状为 (batch_size+1,)
+            # 例如: [0, 4, 10, 15] 表示3个序列,长度分别为4, 6, 5
+            # cu_seqlens_q_cpu[i] 获取第i个序列的起始位置
+            # cu_seqlens_q_cpu[i+1] 获取第i个序列的结束位置(即第i+1个序列的起始位置)
+            # cu_seqlens_q_cpu[i : i + 2][-1] 等价于 cu_seqlens_q_cpu[i+1],取切片的最后一个元素
+            qs = cu_seqlens_q_cpu[i]  # 第i个序列的查询起始索引
+            qe = cu_seqlens_q_cpu[i + 1]  # 第i个序列的查询结束索引
+            
+            # cu_seqlens_k 是累积键序列长度数组,形状为 (batch_size+1,)
+            # 存储方式与 cu_seqlens_q 相同,但表示的是键/值序列的累积长度
+            ks = cu_seqlens_k_cpu[i]  # 第i个序列的键起始索引
+            ke = cu_seqlens_k_cpu[i + 1]  # 第i个序列的键结束索引
 
+            # 提取当前序列的所有查询张量
             current_q = q[qs:qe]
             current_q_succ = q_succ[qs:qe]
             current_q_inter = q_inter[qs:qe]
             current_q_succ_critical = q_succ_critical[qs:qe]
             current_q_inter_critical = q_inter_critical[qs:qe]
 
+            # 根据是否使用块表(分页KV缓存)来设置键值张量
             if block_table is None:
+                # 不使用分页缓存:直接切片获取当前序列的K和V
                 current_k = k[ks:ke]
                 current_v = v[ks:ke]
                 current_block_table = None
                 current_orig_seq_len = orig_seq_lens[i]
             else:
+                # 使用分页缓存:K和V是完整的缓存池,通过块表索引
                 current_block_table = block_table[i]
                 current_orig_seq_len = orig_seq_lens[i]
                 current_k = k
                 current_v = v
+            
+            # 判断是否启用稀疏注意力:
+            # 1. 全局配置启用稀疏注意力
+            # 2. 当前序列长度超过稀疏注意力阈值
             sparse_attn_enabled = (
                 self.sparse_attention_enabled
                 and current_orig_seq_len > self.sparse_attention_threshold
             )
 
+            # 跳过空查询序列
             if current_q.shape[0] == 0:
                 continue
 
+            # 如果键序列为空,返回零张量
             if current_k.shape[0] == 0:
                 all_outputs.append(
                     torch.zeros(
@@ -740,17 +791,23 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 )
                 continue
 
+            # 创建输出张量
             current_output = torch.empty_like(current_q)
+            # 计算分组大小(用于分组查询注意力GQA)
             group_size = int(current_q.size(-2) / current_k.size(-2))
 
             if sparse_attn_enabled:
+                # 稀疏注意力模式:所有头一起处理
                 num_device_q_heads = current_q.size(-2)
+                # 为每个注意力头准备稀疏模式参数
                 heads_vertical_size = torch.empty(
                     size=(num_device_q_heads,), dtype=torch.int32
                 )
                 heads_slash_size = torch.empty(
                     size=(num_device_q_heads,), dtype=torch.int32
                 )
+                
+                # 从配置中读取每个头的稀疏注意力参数
                 for head_id in range(current_q.size(-2)):
                     (
                         ty,
@@ -758,15 +815,18 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         slash_size,
                         _,
                     ) = self.layer_sparse_attention_config[head_id]
+                    # 验证稀疏模式类型
                     assert ty == "vertical_and_slash", "only support slash mode"
 
+                    # 特殊处理:如果vertical_size为30,增加到130
                     if vertical_size == 30:
                         vertical_size += 100
                     heads_vertical_size[head_id] = vertical_size
                     heads_slash_size[head_id] = slash_size
 
+                # 调用稀疏注意力实现,一次处理所有头
                 current_output = self._dual_chunk_flash_attn_prefill_func(
-                    current_q,  # allheads
+                    current_q,  # 所有头的查询
                     current_q_succ,
                     current_q_inter,
                     current_q_succ_critical,
@@ -785,29 +845,58 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     group_size=group_size,
                 )
             else:
+                # 密集注意力模式:逐头处理
                 for head_id in range(current_q.size(-2)):
-                    # (seq_len, num_heads, head_size)
+                    # 提取单个头的查询张量
+                    # current_q 形状: (seq_len, num_heads, head_size)
+                    # [:, head_id, :] 选择所有序列位置的第 head_id 个头的所有特征
+                    # 结果形状: (seq_len, head_size)
+                    # unsqueeze(1) 在第1维插入维度,恢复头维度
+                    # 最终形状: (seq_len, 1, head_size)
                     current_q_head = current_q[:, head_id, :].unsqueeze(1)
                     current_q_succ_head = current_q_succ[:, head_id, :].unsqueeze(1)
                     current_q_inter_head = current_q_inter[:, head_id, :].unsqueeze(1)
+                    # 对于 critical 查询张量,同样的索引操作
+                    # [:, head_id, :] 提取第 head_id 个头
+                    # unsqueeze(1) 恢复头维度以保持张量形状一致性
                     current_q_succ_head_critical = current_q_succ_critical[
                         :, head_id, :
                     ].unsqueeze(1)
                     current_q_inter_head_critical = current_q_inter_critical[
                         :, head_id, :
                     ].unsqueeze(1)
+                    
+                    # 根据是否使用块表提取对应的K和V
                     if block_table is not None:
+                        # 使用分组查询注意力(GQA):多个Q头共享一个KV头
+                        # current_k 形状: (num_blocks, block_size, num_kv_heads, head_size)
+                        # head_id // group_size 计算当前Q头对应的KV头索引
+                        # 例如: group_size=4时, Q头0-3都映射到KV头0
+                        # [..., head_id // group_size, :] 选择:
+                        #   - ... : 保留前面所有维度(num_blocks, block_size)
+                        #   - head_id // group_size : 选择对应的KV头
+                        #   - : : 保留所有head_size特征
+                        # 结果形状: (num_blocks, block_size, head_size)
+                        # unsqueeze(2) 在第2维插入维度,恢复头维度
+                        # 最终形状: (num_blocks, block_size, 1, head_size)
                         current_k_head = current_k[
                             ..., head_id // group_size, :
                         ].unsqueeze(2)
                         current_v_head = current_v[
                             ..., head_id // group_size, :
                         ].unsqueeze(2)
-
                     else:
+                        # 标准多头注意力(MHA):每个Q头有独立的KV头
+                        # current_k 形状: (seq_len, num_heads, head_size)
+                        # [:, head_id, :] 选择第 head_id 个头
+                        # 结果形状: (seq_len, head_size)
+                        # unsqueeze(1) 恢复头维度
+                        # 最终形状: (seq_len, 1, head_size)
                         current_k_head = current_k[:, head_id, :].unsqueeze(1)
                         current_v_head = current_v[:, head_id, :].unsqueeze(1)
 
+                    # 调用单头注意力计算
+                    # 所有输入张量的头维度都是1,表示单头处理
                     current_out = self._dual_chunk_flash_attn_prefill_func(
                         current_q_head,
                         current_q_succ_head,
@@ -824,8 +913,19 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         ke - ks,
                         sparse_attn_enabled=sparse_attn_enabled,
                     )
+                    # 将单头结果写入输出张量
+                    # current_output 形状: (seq_len, num_heads, head_size)
+                    # [:, head_id : head_id + 1, :] 选择第 head_id 个头的位置
+                    # 使用切片 [head_id : head_id + 1] 而不是索引 [head_id]
+                    # 是为了保持维度: (seq_len, 1, head_size)
+                    # current_out 形状: (seq_len, 1, head_size)
+                    # 赋值操作将单头结果填充到对应位置
                     current_output[:, head_id : head_id + 1, :] = current_out
+            
+            # 收集当前序列的输出
             all_outputs.append(current_output)
+        
+        # 将批次中所有序列的输出拼接起来
         return torch.cat(all_outputs, dim=0)
 
     def _dual_chunk_flash_attn_prefill_func(
@@ -848,9 +948,36 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         heads_slash_size=None,
         group_size=None,
     ):
+        """
+        双块Flash Attention预填充函数
+        
+        核心思想:
+        1. 将长序列分成多个chunk进行处理,每个chunk包含:
+           - intra: 当前chunk内的注意力(因果掩码)
+           - succ: 前一个chunk的注意力(非因果)
+           - inter: 更早chunk的注意力(非因果)
+        
+        2. 稀疏注意力优化:
+           - vertical: 选择重要的列(token位置)
+           - slash: 选择重要的对角线(相对位置模式)
+        
+        参数说明:
+        - q: 查询张量 (seq_len, num_heads, head_dim)
+        - q_succ/q_inter: 用于succ/inter chunk的查询
+        - q_succ_critical/q_inter_critical: 用于稀疏注意力选择的关键查询
+        - k, v: 键值张量
+        - block_table: 分页注意力的块表
+        - chunk_size: 块大小
+        - local_size: 局部窗口大小
+        - scaling_factor: RoPE缩放因子
+        - sparse_attn_enabled: 是否启用稀疏注意力
+        - heads_vertical_size/heads_slash_size: 每个头的稀疏模式大小
+        - group_size: GQA的组大小
+        """
         flash_results = []
-        chunk_len = chunk_size - local_size
+        chunk_len = chunk_size - local_size  # 实际chunk长度(去除local窗口)
 
+        # 验证块大小与chunk长度的兼容性
         if block_table is not None:
             block_size = v.shape[1]
             if chunk_len % block_size != 0:
@@ -858,23 +985,89 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         else:
             block_size = 1
 
+        # 应用RoPE缩放因子
         if self.original_max_position_embeddings > 0:
             softmax_scale = softmax_scale * scaling_factor
 
+        # === 初始化处理起点 ===
+        # 
+        # begin: 当前要处理的chunk在KV缓存中的起始位置
+        # 
+        # 计算逻辑:
+        # - k_length: KV缓存的总长度(包含所有历史token)
+        # - q.shape[0]: 当前需要计算注意力的查询token数量
+        # - begin = k_length - q.shape[0]: 从KV缓存中需要开始计算注意力的位置
+        # 
+        # 场景说明:
+        # 1. Prefill场景: 
+        #    - 假设序列总长度为12000,当前prefill最后2000个token
+        #    - k_length = 12000 (完整KV缓存)
+        #    - q.shape[0] = 2000 (只需要为这2000个token计算注意力)
+        #    - begin = 12000 - 2000 = 10000
+        #    - 含义: 从KV缓存的第10000个位置开始,为后续2000个token计算注意力
+        # 
+        # 2. 为什么从这里开始:
+        #    - 前10000个token的注意力输出已经在之前的prefill中计算过
+        #    - 只需要为新增的2000个token(位置10000-11999)计算注意力输出
+        #    - 这些新token需要attend到所有历史token(0-11999)
+        # 
+        # 3. 循环处理:
+        #    - 从begin开始,每次处理一个chunk,直到覆盖所有需要计算的token
+        #    - 每个chunk会计算该chunk内token的注意力输出
         begin = k_length - q.shape[0]
         while begin < k_length:
-            flash_per_chunk = []
+            flash_per_chunk = []  # 存储当前chunk的所有注意力结果
 
+            # === 计算当前chunk的边界位置 ===
+            # 
+            # 目标: 确定当前要处理的chunk在整个序列中的位置范围
+            # 
+            # 1. prev_chunk_end_pos: 当前chunk的起始位置(对齐到chunk边界)
+            #    - begin // chunk_len: 计算begin属于第几个chunk(整数除法)
+            #    - 乘以chunk_len: 将chunk编号转换回序列位置
+            #    - 例如: begin=10000, chunk_len=8192-1024=7168
+            #      -> 10000 // 7168 = 1 (第1个chunk)
+            #      -> 1 * 7168 = 7168 (该chunk从位置7168开始)
             prev_chunk_end_pos = (begin // chunk_len) * chunk_len
+            
+            # 2. next_chunk_end_pos: 下一个chunk的起始位置(即当前chunk的理论结束位置)
+            #    - 例如: prev_chunk_end_pos=7168, chunk_len=7168
+            #      -> next_chunk_end_pos = 7168 + 7168 = 14336
             next_chunk_end_pos = prev_chunk_end_pos + chunk_len
+            
+            # 3. end: 当前chunk的实际结束位置(不能超过序列总长度)
+            #    - 取理论结束位置和序列总长度的较小值
+            #    - 例如: next_chunk_end_pos=14336, k_length=12000
+            #      -> end = min(14336, 12000) = 12000 (最后一个chunk可能不完整)
             end = min(next_chunk_end_pos, k_length)
+            
+            # 4. qbegin: 当前chunk在查询张量q中的起始索引
+            #    - k_length - q.shape[0]: KV缓存中不需要计算注意力的前缀长度
+            #    - begin - (k_length - q.shape[0]): 将KV空间的位置映射到Q空间
+            #    - 例如: begin=10000, k_length=12000, q.shape[0]=2000
+            #      -> qbegin = 10000 - (12000 - 2000) = 0
+            #    - 解释: Q只包含最后2000个token,所以begin=10000对应q的索引0
             qbegin = begin - (k_length - q.shape[0])
+            
+            # 5. qend: 当前chunk在查询张量q中的结束索引
+            #    - 同样的映射逻辑,将end从KV空间映射到Q空间
+            #    - 例如: end=12000, k_length=12000, q.shape[0]=2000
+            #      -> qend = 12000 - (12000 - 2000) = 2000
             qend = end - (k_length - q.shape[0])
+            
+            # 总结:
+            # - KV空间范围: [prev_chunk_end_pos, end) 表示当前chunk在完整序列中的位置
+            # - Q空间范围: [qbegin, qend) 表示当前chunk对应的查询token在q张量中的索引
+            # - 这种映射允许我们处理prefill场景,其中q可能只包含新增的token,
+            #   而KV缓存包含完整的历史token
 
-            qk_chunks = []
-            q_states_intra = q[qbegin:qend]
-            # choose critical token
+            # === 第一部分: Intra-chunk注意力(当前chunk内) ===
+            qk_chunks = []  # 用于稀疏注意力选择的QK分数
+            q_states_intra = q[qbegin:qend]  # 提取当前chunk对应的查询状态
+            
+            # 获取当前chunk的KV状态
             if block_table is not None:
+                # 分页注意力:通过block_table索引
                 block_tables_intra = _get_block(
                     block_table, block_size, prev_chunk_end_pos, end
                 )
@@ -885,31 +1078,98 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     : (end - prev_chunk_end_pos)
                 ]
             else:
+                # 连续内存:直接切片
                 block_tables_intra = None
                 k_states_intra = k[prev_chunk_end_pos:end]
                 v_states_intra = v[prev_chunk_end_pos:end]
 
+            # 稀疏注意力:计算QK分数用于选择重要token
             if sparse_attn_enabled:
+                # 1. 确定用于稀疏注意力选择的查询数量
+                #    - self.sparse_attention_last_q: 配置的最后N个查询token数量(默认64)
+                #    - qend - qbegin: 当前chunk中实际的查询token数量
+                #    - 取较小值,避免超出实际查询范围
+                #    - 例如: 如果chunk只有32个新token,则last_q_size=32而不是64
                 last_q_size = min(qend - qbegin, self.sparse_attention_last_q)
+                
+                # 2. 获取KV状态的维度信息
+                #    - k_states_intra.shape = (seq_len, num_kv_heads, head_dim)
+                #    - num_device_k_heads: 当前设备上的KV头数量(可能因张量并行而小于总头数)
+                #    - head_dim: 每个注意力头的维度(通常是128或64)
                 _, num_device_k_heads, head_dim = k_states_intra.shape
+                
+                # 3. GQA(Grouped Query Attention)扩展 - K状态
+                #    目的: 将较少的KV头扩展到匹配较多的Q头
+                #    
+                #    步骤分解:
+                #    a) unsqueeze(2): 在第2维插入新维度
+                #       形状变化: (seq_len, num_kv_heads, head_dim) 
+                #                -> (seq_len, num_kv_heads, 1, head_dim)
+                #    
+                #    b) repeat(1, 1, group_size, 1): 在新维度上重复group_size次
+                #       - group_size = num_q_heads / num_kv_heads (每个KV头对应的Q头数量)
+                #       - 例如: 如果有32个Q头和8个KV头,则group_size=4
+                #       形状变化: (seq_len, num_kv_heads, 1, head_dim)
+                #                -> (seq_len, num_kv_heads, group_size, head_dim)
+                #    
+                #    c) reshape: 合并KV头和组维度
+                #       形状变化: (seq_len, num_kv_heads, group_size, head_dim)
+                #                -> (seq_len, num_kv_heads * group_size, head_dim)
+                #       - 最终num_kv_heads * group_size = num_q_heads
+                #       - 这样每个Q头都有对应的K头用于计算注意力
                 k_states_intra = (
                     k_states_intra.unsqueeze(2)
                     .repeat(1, 1, group_size, 1)
                     .reshape(-1, num_device_k_heads * group_size, head_dim)
                 )
+                
+                # 4. GQA扩展 - V状态
+                #    与K状态完全相同的扩展逻辑
+                #    确保V头数量也匹配Q头数量
                 v_states_intra = (
                     v_states_intra.unsqueeze(2)
                     .repeat(1, 1, group_size, 1)
                     .reshape(-1, num_device_k_heads * group_size, head_dim)
                 )
+                
+                # 5. 计算QK注意力分数用于稀疏token选择
+                #    
+                #    步骤分解:
+                #    a) q_states_intra.transpose(0, 1): 
+                #       - 原始形状: (seq_len_q, num_heads, head_dim)
+                #       - 转置后: (num_heads, seq_len_q, head_dim)
+                #       - 目的: 将头维度移到最前面,便于批量矩阵乘法
+                #    
+                #    b) [:, -last_q_size:]: 
+                #       - 只取最后last_q_size个查询token
+                #       - 形状: (num_heads, last_q_size, head_dim)
+                #       - 原因: 稀疏注意力只需要最近的查询来选择重要的KV token
+                #    
+                #    c) * softmax_scale: 
+                #       - 缩放因子,通常是 1/sqrt(head_dim)
+                #       - 防止softmax前的logits过大导致梯度消失
+                #    
+                #    d) @ k_states_intra.permute(1, 2, 0):
+                #       - k_states_intra原始: (seq_len_k, num_heads, head_dim)
+                #       - permute后: (num_heads, head_dim, seq_len_k)
+                #       - 矩阵乘法: (num_heads, last_q_size, head_dim) @ (num_heads, head_dim, seq_len_k)
+                #       - 结果形状: (num_heads, last_q_size, seq_len_k)
+                #       - 含义: 每个头的每个查询token对所有键token的注意力分数
+                #    
+                #    e) qk_chunks.append(...):
+                #       - 将当前chunk的QK分数添加到列表
+                #       - 后续会用这些分数来选择最重要的token进行稀疏注意力计算
                 qk_chunks.append(
                     (q_states_intra.transpose(0, 1)[:, -last_q_size:] * softmax_scale)
                     @ k_states_intra.permute(1, 2, 0)
                 )
 
+            # === 第二部分: Succ-chunk注意力(前一个chunk) ===
             if prev_chunk_end_pos - chunk_len >= 0:
                 q_states_succ = q_succ[qbegin:qend]
                 q_states_succ_critical = q_succ_critical[qbegin:qend]
+                
+                # 获取前一个chunk的KV状态
                 if block_table is not None:
                     block_tables_succ = _get_block(
                         block_table,
@@ -924,6 +1184,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         :chunk_len
                     ]
                 else:
+                    # 获取前一个chunk的KV状态
                     k_states_succ = k[
                         prev_chunk_end_pos - chunk_len : prev_chunk_end_pos
                     ]
@@ -932,6 +1193,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     ]
 
                 if sparse_attn_enabled:
+                    # GQA扩展
                     k_states_succ = (
                         k_states_succ.unsqueeze(2)
                         .repeat(1, 1, group_size, 1)
@@ -942,6 +1204,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         .repeat(1, 1, group_size, 1)
                         .reshape(-1, num_device_k_heads * group_size, head_dim)
                     )
+                    # 使用critical查询计算注意力分数
                     qk_chunks.append(
                         (
                             q_states_succ_critical.transpose(0, 1)[:, -last_q_size:]
@@ -950,9 +1213,12 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         @ k_states_succ.permute(1, 2, 0)
                     )
 
+            # === 第三部分: Inter-chunk注意力(更早的chunks) ===
             if prev_chunk_end_pos - chunk_len * 2 >= 0:
                 q_states_inter = q_inter[qbegin:qend]
                 q_states_inter_critical = q_inter_critical[qbegin:qend]
+                
+                # 获取所有更早chunk的KV状态
                 if block_table is not None:
                     block_tables_inter = _get_block(
                         block_table, block_size, 0, prev_chunk_end_pos - chunk_len
@@ -964,10 +1230,12 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         : (prev_chunk_end_pos - chunk_len)
                     ]
                 else:
+                    # 获取所有更早chunk的KV状态
                     k_states_inter = k[: prev_chunk_end_pos - chunk_len]
                     v_states_inter = v[: prev_chunk_end_pos - chunk_len]
 
                 if sparse_attn_enabled:
+                    # GQA扩展
                     k_states_inter = (
                         k_states_inter.unsqueeze(2)
                         .repeat(1, 1, group_size, 1)
@@ -978,6 +1246,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         .repeat(1, 1, group_size, 1)
                         .reshape(-1, num_device_k_heads * group_size, head_dim)
                     )
+                    # 使用critical查询计算注意力分数
                     qk_chunks.append(
                         (
                             q_states_inter_critical.transpose(0, 1)[:, -last_q_size:]
@@ -986,10 +1255,13 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         @ k_states_inter.permute(1, 2, 0)
                     )
 
+            # === 第四部分: 稀疏注意力模式选择 ===
             if sparse_attn_enabled:
+                # 合并所有chunk的QK分数(逆序:inter, succ, intra)
                 reversed_qk = qk_chunks[::-1]
                 qk = torch.cat(reversed_qk, dim=-1)
 
+                # 应用因果掩码到最后的查询
                 qk[:, :, -last_q_size:] = torch.where(
                     self.last_q_mask[..., -last_q_size:, -last_q_size:].to(qk.device),
                     qk[:, :, -last_q_size:],
@@ -997,48 +1269,49 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 )
                 qk = F.softmax(qk, dim=-1, dtype=torch.float32)
 
+                # Vertical模式:列求和,找重要的token位置
                 vertical = qk.sum(-2, keepdim=True)
-                vertical[..., :30] = torch.inf
+                vertical[..., :30] = torch.inf  # 忽略前30个token
 
-                # Avoid sorting by using the min/max ints to fill the indexer
-                # buffers.
+                # 准备缓冲区用于存储每个头的稀疏索引
                 int32_max = torch.iinfo(torch.int32).max
                 int32_min = torch.iinfo(torch.int32).min
                 n_heads = qk.size()[0]
                 max_slash_topk = torch.max(heads_slash_size).item()
                 max_vertical_topk = torch.max(heads_vertical_size).item()
-                # store each head's slash topk, vertical topk
+                
+                # Vertical topk选择
                 vertical = vertical.reshape((n_heads, -1))
-                # prevent out of range when prompt size < max_vertical_topk
                 max_vertical_topk = min(vertical.shape[-1], max_vertical_topk)
                 vertical_topk_buffer = torch.topk(
                     vertical, max_vertical_topk, -1
                 ).indices
+                
+                # Slash topk选择(对角线模式)
                 slash_topk_buffer = torch.empty(
                     size=(n_heads, max_slash_topk), dtype=torch.int64, device=qk.device
                 )
                 for head_i in range(n_heads):
-                    #  (nqheads=1, lastq, k_len)
                     head_score = qk[head_i : head_i + 1, :, :]
+                    # 对角线求和:捕获相对位置模式
                     slash_scores = _sum_all_diagonal_matrix(head_score)
                     if head_score.size(1) != 1:
-                        # drop right up corner
                         slash_scores = slash_scores[..., : -last_q_size + 1]
-                    slash_scores[..., -100:] = torch.inf
+                    slash_scores[..., -100:] = torch.inf  # 忽略最近的100个位置
 
+                    # 选择topk对角线
                     head_slash_size = heads_slash_size[head_i]
                     head_slash_size = min(head_slash_size, vertical.size(-1))
                     slash_topk = torch.topk(slash_scores, head_slash_size, -1).indices
-                    # （nheads, max_topk）
                     slash_topk_buffer[head_i, :head_slash_size] = slash_topk
 
-                    # reset heads topk
                     heads_slash_size[head_i] = head_slash_size
                     heads_vertical_size[head_i] = min(
                         heads_vertical_size[head_i], max_vertical_topk
                     )
 
-                # store
+                # 为每个chunk创建独立的稀疏索引缓冲区
+                # Intra chunk
                 vertical_buffer = torch.full(
                     (n_heads, max_vertical_topk),
                     int32_max,
@@ -1051,6 +1324,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     dtype=torch.int64,
                     device=q.device,
                 )
+                # Succ chunk
                 succ_vertical_buffer = torch.full(
                     (n_heads, max_vertical_topk),
                     int32_max,
@@ -1063,6 +1337,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     dtype=torch.int64,
                     device=q.device,
                 )
+                # Inter chunk
                 inter_vertical_buffer = torch.full(
                     (n_heads, max_vertical_topk),
                     int32_max,
@@ -1076,6 +1351,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     device=q.device,
                 )
 
+                # 大小缓冲区
                 vertical_size_buffer = torch.empty(
                     size=(n_heads,), dtype=torch.int32, device=q.device
                 )
@@ -1095,15 +1371,18 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     size=(n_heads,), dtype=torch.int32, device=q.device
                 )
 
+                # 为每个头分配稀疏索引到对应的chunk
                 for head_i in range(n_heads):
                     vertical_topk = vertical_topk_buffer[
                         head_i, : heads_vertical_size[head_i]
                     ]
-                    # intra
+                    
+                    # === Intra chunk索引 ===
                     intra_vertical_indices = (
                         vertical_topk[vertical_topk >= prev_chunk_end_pos]
                         - prev_chunk_end_pos
                     )
+                    # 如果没有选中的索引,使用均匀采样作为后备
                     if intra_vertical_indices.nelement() == 0:
                         intra_vertical_indices = torch.cat(
                             [
@@ -1117,24 +1396,27 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                                 ),
                             ]
                         )
+                    
                     slash_topk = slash_topk_buffer[head_i, : heads_slash_size[head_i]]
                     intra_slash_indices = (qk.size(-1) - 1) - slash_topk[
                         slash_topk >= prev_chunk_end_pos
                     ]
-                    # fill buffer
+                    
+                    # 填充缓冲区
                     v_count = intra_vertical_indices.nelement()
                     s_count = intra_slash_indices.nelement()
                     vertical_size_buffer[head_i] = v_count
                     slash_sizes_buffer[head_i] = s_count
                     vertical_buffer[head_i, :v_count].copy_(intra_vertical_indices)
                     slash_buffer[head_i, :s_count].copy_(intra_slash_indices)
-                    # succ
+                    
+                    # === Succ chunk索引 ===
                     if prev_chunk_end_pos - chunk_len >= 0:
                         succ_vertical_indices = vertical_topk[
                             (vertical_topk < prev_chunk_end_pos)
                             & (vertical_topk >= prev_chunk_end_pos - chunk_len)
                         ] - (prev_chunk_end_pos - chunk_len)
-                        # TODO: support no vertical
+                        
                         if succ_vertical_indices.nelement() == 0:
                             succ_vertical_indices = torch.cat(
                                 [
@@ -1148,6 +1430,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                                     ),
                                 ]
                             )
+                        
                         succ_slash_indices = (
                             prev_chunk_end_pos + (qend - qbegin) - 1
                         ) - slash_topk[
@@ -1156,6 +1439,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                                 & (slash_topk < (prev_chunk_end_pos + (qend - qbegin)))
                             )
                         ]
+                        
                         if succ_slash_indices.nelement() == 0:
                             succ_slash_indices = torch.cat(
                                 [
@@ -1169,7 +1453,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                                     ),
                                 ]
                             )
-                        # fill buffer
+                        
                         v_count = succ_vertical_indices.nelement()
                         s_count = succ_slash_indices.nelement()
                         succ_vertical_size_buffer[head_i] = v_count
@@ -1179,6 +1463,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         )
                         succ_slash_buffer[head_i, :s_count].copy_(succ_slash_indices)
 
+                    # === Inter chunk索引 ===
                     if prev_chunk_end_pos - 2 * chunk_len >= 0:
                         inter_vertical_indices = vertical_topk[
                             vertical_topk < prev_chunk_end_pos - chunk_len
@@ -1197,12 +1482,14 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                                     ),
                                 ]
                             )
+                        
                         inter_slash_indices = (
                             prev_chunk_end_pos - chunk_len + (qend - qbegin) - 1
                         ) - slash_topk[
                             slash_topk
                             < (prev_chunk_end_pos - chunk_len + (qend - qbegin))
                         ]
+                        
                         if inter_slash_indices.nelement() == 0:
                             inter_slash_indices = torch.cat(
                                 [
@@ -1216,7 +1503,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                                     ),
                                 ]
                             )
-                        # fill buffer
+                        
                         v_count = inter_vertical_indices.nelement()
                         s_count = inter_slash_indices.nelement()
                         inter_vertical_size_buffer[head_i] = v_count
@@ -1226,10 +1513,13 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         )
                         inter_slash_buffer[head_i, :s_count].copy_(inter_slash_indices)
             else:
+                # 非稀疏模式:不使用索引
                 intra_vertical_indices, intra_slash_indices = None, None
                 succ_vertical_indices, succ_slash_indices = None, None
                 inter_vertical_indices, inter_slash_indices = None, None
 
+            # === 第五部分: 执行Flash Attention ===
+            # Intra chunk (因果注意力)
             if sparse_attn_enabled:
                 flash_result = self._do_flash_attn(
                     q_states_intra,
@@ -1259,6 +1549,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 )
             flash_per_chunk.append(flash_result)
 
+            # Succ chunk (非因果注意力)
             if prev_chunk_end_pos - chunk_len >= 0:
                 if sparse_attn_enabled:
                     flash_result = self._do_flash_attn(
@@ -1289,6 +1580,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     )
                 flash_per_chunk.append(flash_result)
 
+            # Inter chunk (非因果注意力)
             if prev_chunk_end_pos - chunk_len * 2 >= 0:
                 if sparse_attn_enabled:
                     flash_result = self._do_flash_attn(
@@ -1322,6 +1614,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             flash_results.append(flash_per_chunk)
             begin = end
 
+        # === 第六部分: 合并所有chunk的结果 ===
         attn_output = self._merge_attn_outputs(flash_results)
         del flash_results
         return attn_output
