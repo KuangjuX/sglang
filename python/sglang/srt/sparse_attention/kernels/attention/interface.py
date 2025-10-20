@@ -66,57 +66,111 @@ def _flash_attn_fwd(
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    # Block size and threading parameters for kernel tuning
     # m_block_size: int = 128,
     # n_block_size: int = 64,
     # num_threads: int = 128,
-    m_block_size: int = 128,
-    n_block_size: int = 128,
-    num_threads: int = 384,
-    pack_gqa: Optional[bool] = None,
-    _compute_capability: Optional[int] = None,
-    groupwise: Optional[bool] = False
+    m_block_size: int = 128,  # Query block size (M dimension)
+    n_block_size: int = 128,  # Key/Value block size (N dimension)
+    num_threads: int = 384,   # Number of threads per block
+    pack_gqa: Optional[bool] = None,  # Whether to pack GQA heads for efficiency
+    _compute_capability: Optional[int] = None,  # Override GPU compute capability
+    groupwise: Optional[bool] = False  # Enable groupwise attention (for grouped KV cache)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Flash Attention forward pass implementation.
+    
+    This function performs efficient attention computation using the Flash Attention algorithm,
+    which reduces memory usage by avoiding materialization of the full attention matrix.
+    
+    Args:
+        q: Query tensor, shape (batch, seqlen_q, num_heads, head_dim) or (total_q, num_heads, head_dim) for varlen
+        k: Key tensor, shape (batch, seqlen_k, num_heads_kv, head_dim) or (total_k, num_heads_kv, head_dim) for varlen
+           or (num_pages, page_size, num_heads_kv, head_dim) for paged KV cache
+        v: Value tensor, same shape as k but with head_dim_v in last dimension
+        cu_seqlens_q: Cumulative sequence lengths for queries (varlen mode), shape (batch+1,)
+        cu_seqlens_k: Cumulative sequence lengths for keys (varlen mode), shape (batch+1,)
+        seqused_q: Actual sequence lengths used for queries, shape (batch,)
+        seqused_k: Actual sequence lengths used for keys, shape (batch,)
+        page_table: Page table for paged KV cache, shape (batch, max_num_pages) or (batch*num_heads_kv, max_num_pages) for groupwise
+        softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
+        causal: Whether to apply causal masking (for autoregressive models)
+        softcap: Softcapping value for attention scores (0.0 to disable)
+        window_size_left: Left window size for sliding window attention
+        window_size_right: Right window size for sliding window attention
+        learnable_sink: Learnable sink tokens, shape (num_heads,)
+        m_block_size: Block size for query dimension (tuning parameter)
+        n_block_size: Block size for key/value dimension (tuning parameter)
+        num_threads: Number of threads per CUDA block (tuning parameter)
+        pack_gqa: Whether to pack grouped query attention heads (auto-detected if None)
+        _compute_capability: Override GPU compute capability for testing
+        groupwise: Enable groupwise attention with per-head page tables
+        
+    Returns:
+        out: Attention output, same shape as q but with head_dim_v
+        lse: Log-sum-exp values for backward pass, shape (batch, num_heads, seqlen_q) or (num_heads, total_q)
+    """
+    # Ensure all input tensors are contiguous in memory for efficient kernel access
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
-    num_head, head_dim = q.shape[-2:]
-    num_head_kv = k.shape[-2]
-    head_dim_v = v.shape[-1]
-    qhead_per_kvhead = num_head // num_head_kv
+    
+    # Extract shape information
+    num_head, head_dim = q.shape[-2:]  # Number of query heads and head dimension
+    num_head_kv = k.shape[-2]  # Number of key/value heads (can be less than num_head for GQA)
+    head_dim_v = v.shape[-1]  # Value head dimension (can differ from head_dim)
+    qhead_per_kvhead = num_head // num_head_kv  # Query heads per KV head (GQA ratio)
+    
+    # Determine batch size and sequence lengths based on whether varlen mode is used
     if cu_seqlens_q is None:
+        # Standard batched mode: q has shape (batch, seqlen_q, num_heads, head_dim)
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
     else:
-        batch_size = cu_seqlens_q.shape[0] - 1
-        seqlen_q = None
-        total_q = q.shape[0]
+        # Variable length mode: q has shape (total_q, num_heads, head_dim)
+        batch_size = cu_seqlens_q.shape[0] - 1  # cu_seqlens has batch+1 elements
+        seqlen_q = None  # Variable per sequence
+        total_q = q.shape[0]  # Total number of query tokens across all sequences
+    
+    # Handle paged KV cache
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
         assert page_table.dtype == torch.int32, "page_table must be int32"
         assert page_table.stride(-1) == 1, "page_table must be contiguous in the last dimension"
         max_num_pages_per_seq = page_table.shape[1]
         if groupwise:
+            # Groupwise mode: separate page table for each KV head
             assert page_table.shape == (batch_size * num_head_kv, max_num_pages_per_seq)
         else:
+            # Standard mode: shared page table across all heads
             assert page_table.shape == (batch_size, max_num_pages_per_seq)
         num_pages, page_size = k.shape[:2]
-        seqlen_k = num_pages * page_size
+        seqlen_k = num_pages * page_size  # Total KV sequence length
     else:
         num_pages, page_size = None, None
-        seqlen_k = k.shape[-3]
+        seqlen_k = k.shape[-3]  # KV sequence length from tensor shape
+    
+    # Validate tensor shapes
     if cu_seqlens_k is None:
         if page_table is None:
+            # Standard batched KV cache
             assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
             assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
         else:
+            # Paged KV cache
             assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
             assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
+        # Variable length KV cache
         assert k.shape == (seqlen_k, num_head_kv, head_dim)
         assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
+    
+    # Validate optional tensors
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
     assert seqused_q is None or seqused_q.shape == (batch_size,), "seqused_q must have shape (batch_size,)"
     assert seqused_k is None or seqused_k.shape == (batch_size,), "seqused_k must have shape (batch_size,)"
+    
+    # Validate data types
     assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
@@ -126,27 +180,41 @@ def _flash_attn_fwd(
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+    
+    # Validate device placement
     assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table, learnable_sink)), "inputs must be on CUDA device"
+    
+    # Validate dimensions
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
-    alignment = 16 // q.element_size()
+    alignment = 16 // q.element_size()  # Alignment requirement based on element size
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+    
+    # Set default softmax scale if not provided
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+    
+    # Handle softcap (0.0 means disabled)
     if softcap == 0.0:
         softcap = None
+    
+    # Auto-detect whether to pack GQA heads
     if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
+        pack_gqa = qhead_per_kvhead > 1  # Pack if using grouped query attention
 
+    # Prepare output tensors
     out_torch_dtype = q.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+    
+    # Prepare log-sum-exp tensor for backward pass (only if gradients are needed)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
     lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad else None
 
+    # Convert PyTorch tensors to CUTLASS cute tensors for kernel interface
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -158,26 +226,28 @@ def _flash_attn_fwd(
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
     ]
     page_table_tensor = from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1) if page_table is not None else None
+    
+    # Handle causal and local attention settings
     if causal:
-        window_size_right = 0
+        window_size_right = 0  # Causal means no looking ahead
     local = window_size_left is not None or window_size_right is not None
     if window_size_left is not None or window_size_right is not None:
         if window_size_left is None and window_size_right == 0:
-            causal, local = True, False
+            causal, local = True, False  # This is just causal attention
         else:
-            causal, local = False, True
+            causal, local = False, True  # This is sliding window attention
+    
+    # Determine compute capability and select appropriate kernel
     compute_capability = torch.cuda.get_device_capability()[0] if _compute_capability is None else _compute_capability
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # if compute_capability == 9:  # TODO: tune block size according to hdim
-    #     if head_dim == head_dim_v == 128 and not causal and not local:
-    #         n_block_size = 192
+    # Disable pack_gqa for SM 10.0 in certain cases (varlen or incompatible GQA ratio)
     if compute_capability == 10:
-        # TODO: fix the varlen case
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
 
+    # Create compilation key for kernel caching
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
@@ -187,10 +257,11 @@ def _flash_attn_fwd(
         m_block_size, n_block_size, num_threads, pack_gqa,
         compute_capability, groupwise,
     )
+    
+    # Compile kernel if not already cached
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
-            # assert page_table is None, "paged KV not supported on SM 9.0"
-            # fa_fwd = FlashAttentionForwardSm80(
+            # Use SM 9.0 (Hopper) kernel
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
                 head_dim,
@@ -201,13 +272,13 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                # num_stages=1,
-                num_stages=2,
+                num_stages=2,  # Pipeline stages for overlapping computation and memory access
                 num_threads=num_threads,
-                Q_in_regs=False,
+                Q_in_regs=False,  # Whether to keep Q in registers
                 groupwise=groupwise,
             )
         elif compute_capability == 10:
+            # Use SM 10.0 (Blackwell) kernel
             assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
@@ -227,12 +298,15 @@ def _flash_attn_fwd(
             page_table_tensor,
             softcap, window_size_left, window_size_right, learnable_sink_tensor,
         )
+    
+    # Execute the compiled kernel
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
         page_table_tensor,
         softcap, window_size_left, window_size_right, learnable_sink_tensor,
     )
+    
     return out, lse
 
 
