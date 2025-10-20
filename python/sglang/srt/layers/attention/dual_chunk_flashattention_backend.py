@@ -1635,83 +1635,210 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         mergehead_softmax_scale: Optional[float] = None,
         sparse_attn_enabled: Optional[bool] = False,
     ):
+        """
+        执行Flash Attention计算
+        
+        这是一个核心的注意力计算函数,支持两种模式:
+        1. 稀疏注意力模式(sparse_attn_enabled=True): 使用vertical和slash索引进行稀疏计算
+        2. 标准Flash Attention模式(sparse_attn_enabled=False): 使用flash_attn_varlen_func
+        
+        参数说明:
+            query_states: 查询张量 (seq_len_q, num_heads, head_dim)
+            key_states: 键张量 (seq_len_k, num_heads, head_dim) 或 (seq_len_k, num_kv_heads, head_dim)
+            value_states: 值张量 (seq_len_k, num_heads, head_dim) 或 (seq_len_k, num_kv_heads, head_dim)
+            softmax_scale: softmax缩放因子,通常为 1/sqrt(head_dim)
+            causal: 是否使用因果掩码
+                   - True: 用于intra-chunk(当前块内),防止看到未来token
+                   - False: 用于succ/inter-chunk(跨块),可以看到所有历史token
+            max_seqlen_k: 键序列的最大长度,如果为None则使用key_states.shape[0]
+            stage: 注意力阶段标识 ("intra", "succ", "inter")
+                   - "intra": 当前chunk内的注意力
+                   - "succ": 前一个chunk的注意力
+                   - "inter": 更早chunks的注意力
+            vertical_indices: 垂直稀疏模式的索引 (num_heads, max_vertical_topk)
+                             选择重要的token位置(列)
+            slash_indices: 对角线稀疏模式的索引 (num_heads, max_slash_topk)
+                          选择重要的相对位置模式(对角线)
+            vertical_indices_count: 每个头实际使用的vertical索引数量 (num_heads,)
+            slash_indices_count: 每个头实际使用的slash索引数量 (num_heads,)
+            mergehead_softmax_scale: 合并多头时使用的softmax缩放因子
+            sparse_attn_enabled: 是否启用稀疏注意力
+        
+        返回:
+            tuple: (output, softmax_lse)
+                - output: 注意力输出 (seq_len_q, num_heads, head_dim)
+                - softmax_lse: log-sum-exp值 (1, num_heads, seq_len_q)
+                  用于后续合并多个chunk的注意力结果
+        """
+        # === 第一部分: 参数初始化和验证 ===
+        
+        # 如果未指定max_seqlen_k,使用key_states的实际长度
         if max_seqlen_k is None:
             max_seqlen_k = key_states.shape[0]
 
-        q_len = query_states.shape[0]
-        q_heads = query_states.shape[1]
-        h_dim = query_states.shape[-1]
+        # 提取查询张量的维度信息
+        q_len = query_states.shape[0]      # 查询序列长度
+        q_heads = query_states.shape[1]    # 查询头数量
+        h_dim = query_states.shape[-1]     # 每个头的维度
 
+        # === 第二部分: 稀疏注意力模式 ===
         if sparse_attn_enabled:
-            assert slash_indices is not None
+            # 验证必需的参数
+            assert slash_indices is not None, "稀疏注意力需要slash_indices"
+            
+            # 验证stage和causal的一致性
             if stage == "intra":
-                assert causal
+                # intra-chunk必须使用因果掩码(不能看到未来token)
+                assert causal, "intra阶段必须使用因果掩码"
             else:
-                assert not causal
+                # succ/inter-chunk不使用因果掩码(可以看到所有历史token)
+                assert not causal, "succ/inter阶段不应使用因果掩码"
 
+            # === 张量形状转换 ===
+            # 目标: 将输入张量从 (seq_len, num_heads, head_dim) 
+            #      转换为 (batch_size=1, num_heads, seq_len, head_dim)
+            # 
+            # 步骤分解:
+            # 1. unsqueeze(0): 在第0维添加batch维度
+            #    (seq_len, num_heads, head_dim) -> (1, seq_len, num_heads, head_dim)
+            # 
+            # 2. transpose(1, 2): 交换seq_len和num_heads维度
+            #    (1, seq_len, num_heads, head_dim) -> (1, num_heads, seq_len, head_dim)
+            # 
+            # 原因: 稀疏注意力函数期望batch-first格式,且头维度在序列维度之前
             query_states = query_states.unsqueeze(0).transpose(1, 2)
             key_states = key_states.unsqueeze(0).transpose(1, 2)
             value_states = value_states.unsqueeze(0).transpose(1, 2)
 
+            # 使用简短变量名,提高代码可读性
             q = query_states
             k = key_states
             v = value_states
 
+            # === 分支1: 带有per-head索引计数的稀疏注意力 ===
+            # 这个分支用于inter-chunk,因为不同的头可能需要不同数量的稀疏索引
             if vertical_indices_count is not None and slash_indices_count is not None:
-                assert mergehead_softmax_scale is not None
+                # 验证必需的缩放因子
+                assert mergehead_softmax_scale is not None, \
+                    "per-head索引计数模式需要mergehead_softmax_scale"
 
+                # 调用稀疏注意力核心函数
+                # 返回:
+                # - res: 注意力输出 (1, num_heads, seq_len_q, head_dim)
+                # - s_lse: log-sum-exp值 (1, num_heads, seq_len_q, 1)
                 res, s_lse = _vertical_slash_sparse_attention(
                     q,
                     k,
                     v,
-                    vertical_indices,
-                    slash_indices,
-                    mergehead_softmax_scale,
+                    vertical_indices,           # 垂直稀疏索引
+                    slash_indices,              # 对角线稀疏索引
+                    mergehead_softmax_scale,    # 合并头的缩放因子
                     causal=causal,
                     stage=stage,
-                    vertical_indices_count=vertical_indices_count,
-                    slash_indices_count=slash_indices_count,
+                    vertical_indices_count=vertical_indices_count,  # 每个头的vertical索引数量
+                    slash_indices_count=slash_indices_count,        # 每个头的slash索引数量
                 )
-                res = res.view(q_heads, q_len, h_dim).transpose(
-                    0, 1
-                )  # (qlen,nhead,h_dim)
+                
+                # === 输出形状转换 ===
+                # 目标: 将输出从 (1, num_heads, seq_len_q, head_dim)
+                #      转换回 (seq_len_q, num_heads, head_dim)
+                # 
+                # 步骤:
+                # 1. view(q_heads, q_len, h_dim): 移除batch维度并重排
+                #    (1, num_heads, seq_len_q, head_dim) -> (num_heads, seq_len_q, head_dim)
+                # 
+                # 2. transpose(0, 1): 交换头维度和序列维度
+                #    (num_heads, seq_len_q, head_dim) -> (seq_len_q, num_heads, head_dim)
+                res = res.view(q_heads, q_len, h_dim).transpose(0, 1)
+                
+                # === LSE形状转换 ===
+                # 目标: 将LSE从 (1, num_heads, seq_len_q, 1)
+                #      转换为 (1, num_heads, seq_len_q)
+                # 
+                # 步骤:
+                # 1. view(q_heads, q_len, 1): 重排维度
+                # 2. squeeze(-1): 移除最后的单维度
+                # 3. unsqueeze(0): 添加batch维度
+                # 4. float(): 转换为float32以提高数值稳定性
                 s_lse = (
                     s_lse.view(q_heads, q_len, 1).squeeze(-1).unsqueeze(0).float()
-                )  # (1, nhead,qlen)
+                )
+            
+            # === 分支2: 统一索引的稀疏注意力 ===
+            # 这个分支用于intra和succ-chunk,所有头使用相同数量的稀疏索引
             else:
+                # 调用稀疏注意力核心函数(不传递per-head计数)
                 res, s_lse = _vertical_slash_sparse_attention(
                     q,
                     k,
                     v,
                     vertical_indices,
                     slash_indices,
-                    softmax_scale,
+                    softmax_scale,      # 使用标准softmax缩放因子
                     causal=causal,
                     stage=stage,
                 )
+                
+                # === 输出形状转换 ===
+                # 直接reshape为目标形状
+                # (1, num_heads, seq_len_q, head_dim) -> (seq_len_q, num_heads, head_dim)
                 res = res.view(q_len, q_heads, h_dim)
+                
+                # === LSE形状转换 ===
+                # (1, num_heads, seq_len_q, 1) -> (1, num_heads, seq_len_q)
+                # transpose(0, 2): 将batch维度和seq_len维度交换
                 s_lse = s_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
+            
+            # 返回稀疏注意力结果
             return res, s_lse
 
+        # === 第三部分: 标准Flash Attention模式 ===
+        # 使用flash-attn库的变长序列函数
+        # 
+        # flash_attn_varlen_func特点:
+        # 1. 支持变长序列(通过cu_seqlens指定每个序列的边界)
+        # 2. 内存高效(使用tiling和recomputation)
+        # 3. 速度快(优化的CUDA kernel)
         output, softmax_lse, *rest = flash_attn_varlen_func(
             q=query_states,
             k=key_states,
             v=value_states,
             softmax_scale=softmax_scale,
+            
+            # === 查询序列的累积长度 ===
+            # cu_seqlens_q: 指定每个序列在batch中的起始和结束位置
+            # 格式: [0, len1, len1+len2, ...]
+            # 这里只有一个序列,所以是 [0, query_states.shape[0]]
             cu_seqlens_q=torch.tensor(
                 [0, query_states.shape[0]],
                 dtype=torch.int32,
                 device=query_states.device,
             ),
-            max_seqlen_q=query_states.shape[0],
+            max_seqlen_q=query_states.shape[0],  # 查询序列的最大长度
+            
+            # === 键序列的累积长度 ===
             cu_seqlens_k=torch.tensor(
-                [0, max_seqlen_k], dtype=torch.int32, device=query_states.device
+                [0, max_seqlen_k], 
+                dtype=torch.int32, 
+                device=query_states.device
             ),
-            max_seqlen_k=max_seqlen_k,
-            causal=causal,
-            return_softmax_lse=True,
+            max_seqlen_k=max_seqlen_k,  # 键序列的最大长度
+            
+            causal=causal,              # 是否使用因果掩码
+            return_softmax_lse=True,    # 返回log-sum-exp值用于后续合并
         )
+        
+        # === LSE形状转换 ===
+        # flash_attn_varlen_func返回的softmax_lse形状: (num_heads, seq_len_q)
+        # 需要转换为: (1, num_heads, seq_len_q)
+        # 
+        # 步骤:
+        # 1. view(q_len, q_heads, 1): 重排为 (seq_len_q, num_heads, 1)
+        # 2. transpose(0, 2): 交换seq_len和batch维度 -> (1, num_heads, seq_len_q)
+        # 3. float(): 转换为float32
         softmax_lse = softmax_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
+        
+        # 返回标准Flash Attention结果
         return output, softmax_lse
 
     def _merge_attn_outputs(
@@ -1719,41 +1846,176 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         flash_results: List[List[Tuple[torch.Tensor, torch.Tensor]]],
         return_lse: Optional[bool] = False,
     ) -> torch.Tensor:
-        attn_outputs_all = []
-        logits_all = []
+        """
+        合并多个chunk的注意力输出
+        
+        这个函数负责将dual-chunk attention中多个chunk的注意力结果合并成最终输出。
+        每个chunk可能包含多个阶段(intra/succ/inter)的注意力结果,需要正确地加权合并。
+        
+        核心算法:
+        1. 对于单阶段chunk: 直接使用其输出
+        2. 对于多阶段chunk: 使用log-sum-exp技巧进行数值稳定的softmax加权合并
+        
+        参数说明:
+            flash_results: 嵌套列表结构
+                          外层列表: 每个元素对应一个chunk
+                          内层列表: 每个元素对应该chunk的一个注意力阶段(intra/succ/inter)
+                          元组: (output, softmax_lse)
+                              - output: 注意力输出 (seq_len, num_heads, head_dim)
+                              - softmax_lse: log-sum-exp值 (1, num_heads, seq_len)
+            return_lse: 是否返回合并后的log-sum-exp值
+                       通常用于调试或进一步的数值分析
+        
+        返回:
+            如果return_lse=False: 合并后的注意力输出 (total_seq_len, num_heads, head_dim)
+            如果return_lse=True: (合并后的输出, 合并后的lse值)
+        
+        数学原理:
+            对于多个注意力结果 o_1, o_2, ..., o_n 和对应的 lse_1, lse_2, ..., lse_n
+            合并公式: output = Σ(o_i * exp(lse_i)) / Σ(exp(lse_i))
+            
+            为了数值稳定,使用log-space计算:
+            1. max_lse = max(lse_1, lse_2, ..., lse_n)
+            2. stable_lse_i = lse_i - max_lse
+            3. weight_i = exp(stable_lse_i) / Σ(exp(stable_lse_j))
+            4. output = Σ(o_i * weight_i)
+        """
+        # === 第一部分: 初始化累积列表 ===
+        attn_outputs_all = []  # 存储每个chunk的合并输出
+        logits_all = []        # 存储每个chunk的合并lse值(如果需要)
 
+        # === 第二部分: 遍历每个chunk的结果 ===
         for flash_per_chunk in flash_results:
+            # === 情况1: 单阶段chunk ===
+            # 如果chunk只有一个注意力阶段(通常是只有intra-chunk的情况)
+            # 直接使用该阶段的输出,无需合并
             if len(flash_per_chunk) == 1:
+                # len(flash_per_chunk) == 1 表示当前chunk只计算了一个注意力阶段
+                # 
+                # 这种情况发生在:
+                # 1. 第一个chunk: 只有intra-chunk注意力(因为没有历史chunk可以attend)
+                # 2. 第二个chunk: 只有intra + succ两个阶段(有前一个chunk,但没有inter)
+                # 3. 某些特殊情况: 如果prev_chunk_end_pos条件不满足,可能跳过某些阶段
+                # 
+                # 注意: 实际上len==1通常不只是"只有intra"的情况,也可能是其他单阶段场景
+                # 但在dual-chunk架构中,第一个chunk确实只会有intra阶段
+                # 
+                # flash_per_chunk[0][0]: 第一个(也是唯一)阶段的output
                 attn_outputs_all.append(flash_per_chunk[0][0])
+                
+                # 如果需要返回lse值,也保存它
                 if return_lse:
+                    # flash_per_chunk[0][1]: 第一个阶段的softmax_lse
                     logits_all.append(flash_per_chunk[0][1])
+                
+                # 跳过后续的合并逻辑
                 continue
 
+            # === 情况2: 多阶段chunk ===
+            # chunk包含多个注意力阶段(如intra + succ, 或 intra + succ + inter)
+            # 需要将这些阶段的结果加权合并
+            
+            # === 步骤1: 堆叠所有阶段的输出 ===
+            # 从每个阶段的元组中提取output(索引0)
+            # 堆叠后形状: (num_stages, seq_len, num_heads, head_dim)
             attn_outputs = torch.stack(
                 [flash_attn_output[0] for flash_attn_output in flash_per_chunk]
             )
+            
+            # 从每个阶段的元组中提取softmax_lse(索引1)
+            # 堆叠后形状: (num_stages, 1, num_heads, seq_len)
             logits = torch.stack(
                 [flash_attn_output[1] for flash_attn_output in flash_per_chunk]
             )
+            
+            # 转换为float32以提高数值稳定性
+            # LSE值的精度对最终结果影响很大
             logits = logits.to(torch.float32)
 
+            # === 步骤2: 计算合并后的LSE(如果需要) ===
             if return_lse:
+                # 使用log-sum-exp技巧合并多个LSE值
+                # 
+                # 数学公式: log(exp(a) + exp(b)) = max(a,b) + log(1 + exp(-|a-b|))
+                # 这个公式避免了直接计算exp可能导致的数值溢出
+                
+                # 找到所有LSE的最大值,用于数值稳定
                 max_val = torch.max(logits, dim=0).values
+                
+                # 计算两个LSE之间的差值
+                # 注意: 这里假设只有2个阶段(如intra+succ)
                 diff = torch.abs(logits[0] - logits[1])
+                
+                # 使用log1p(x) = log(1+x)来提高数值稳定性
+                # log_sum_exp = max + log(1 + exp(-diff))
                 log_sum_exp = max_val + torch.log1p(torch.exp(-diff))
+                
+                # 保存合并后的LSE值
                 logits_all.append(log_sum_exp)
 
+            # === 步骤3: 计算加权系数(数值稳定版本) ===
+            # 目标: 计算每个阶段的权重 weight_i = exp(lse_i) / Σ(exp(lse_j))
+            
+            # 3.1: 找到最大的LSE值,用于数值稳定
+            # 形状: (1, num_heads, seq_len)
             max_logits = torch.max(logits, dim=0).values
+            
+            # 3.2: 减去最大值,防止exp溢出
+            # stable_logits_i = lse_i - max_lse
+            # 形状: (num_stages, 1, num_heads, seq_len)
             stable_logits = logits - max_logits.unsqueeze(0)
+            
+            # 3.3: 计算exp(stable_logits)
+            # lse_s_i = exp(lse_i - max_lse)
+            # detach()防止梯度回传到LSE值(LSE只用于加权,不需要梯度)
             lse_s = torch.exp(stable_logits).detach()
+            
+            # 3.4: 计算归一化因子
+            # lse_sum = Σ(exp(lse_i - max_lse))
+            # 形状: (1, num_heads, seq_len)
             lse_sum = torch.sum(lse_s, dim=0)
+            
+            # 3.5: 归一化得到权重
+            # weight_i = exp(lse_i - max_lse) / Σ(exp(lse_j - max_lse))
+            # 这等价于: weight_i = exp(lse_i) / Σ(exp(lse_j))
+            # 形状: (num_stages, 1, num_heads, seq_len)
             lse_s /= lse_sum
+
+            # === 步骤4: 应用权重到注意力输出 ===
+            # 目标: output = Σ(o_i * weight_i)
+            
+            # 4.1: 调整权重的形状以匹配attn_outputs
+            # 当前权重形状: (num_stages, 1, num_heads, seq_len)
+            # 目标形状: (num_stages, seq_len, num_heads, 1)
+            # 
+            # 步骤:
+            # - unsqueeze(-1): (num_stages, 1, num_heads, seq_len) 
+            #                  -> (num_stages, 1, num_heads, seq_len, 1)
+            # - transpose(2, 3): 交换num_heads和seq_len
+            #                    -> (num_stages, 1, seq_len, num_heads, 1)
+            # - squeeze(1): 移除batch维度
+            #               -> (num_stages, seq_len, num_heads, 1)
+            # 
+            # 4.2: 广播乘法
+            # attn_outputs形状: (num_stages, seq_len, num_heads, head_dim)
+            # 权重形状: (num_stages, seq_len, num_heads, 1)
+            # 结果: 每个head_dim都乘以对应的权重
             attn_outputs *= lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1)
+            
+            # 4.3: 沿着stage维度求和,得到加权平均
+            # 形状: (seq_len, num_heads, head_dim)
             attn_outputs_all.append(attn_outputs.sum(dim=0))
 
+        # === 第三部分: 拼接所有chunk的结果 ===
         if return_lse:
+            # 返回输出和LSE值
+            # 沿着seq_len维度拼接所有chunk
+            # 输出形状: (total_seq_len, num_heads, head_dim)
+            # LSE形状: (1, num_heads, total_seq_len)
             return (torch.cat(attn_outputs_all, dim=0), torch.cat(logits_all, dim=-1))
         else:
+            # 只返回输出
+            # 形状: (total_seq_len, num_heads, head_dim)
             return torch.cat(attn_outputs_all, dim=0)
 
     def _dual_chunk_flash_attn_decoding(
