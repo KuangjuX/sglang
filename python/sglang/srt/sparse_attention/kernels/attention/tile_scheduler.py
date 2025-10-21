@@ -576,156 +576,494 @@ class SingleTileVarlenScheduler:
         return SingleTileVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
+
+@dataclass
+class BlockSparseMaskArguments(ParamsBase):
+    """
+    块稀疏掩码参数
+    
+    与 C++ fwdBlockmask 对应，存储预计算的块稀疏掩码信息
+    """
+    mBlockmask: cute.Tensor  # 块掩码张量 [B*num_heads, M_blocks, N_blocks]，存储优先级值
+    m_block_dim: cutlass.Constexpr[int]  # 大块的 M 维度
+    n_block_dim: cutlass.Constexpr[int]  # 大块的 N 维度
+    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]  # CUDA kernel 块大小 (kBlockM, kBlockN)
+    seqlen_q_rounded: cutlass.Constexpr[int]  # 向上取整的 Q 序列长度
+    seqlen_k_rounded: cutlass.Constexpr[int]  # 向上取整的 K 序列长度
+    num_blocksparse_heads: cutlass.Constexpr[int]  # 稀疏掩码类型数量
+
+
+class BlockSparseMaskIterator:
+    """
+    块稀疏掩码迭代器
+    
+    <design>
+    设计目标：
+    - 提供基于预计算掩码的高效块遍历功能
+    - 支持优先级调度和二分查找优化
+    - 在 device 端运行，最小化内存访问和分支开销
+    
+    核心概念：
+    1. 两级块结构：
+       - 大块 (m_block_dim x n_block_dim)：预计算掩码的粒度
+       - 小块 (kBlockM x kBlockN)：CUDA kernel tile 的粒度
+       - 转换因子：row_factor = m_block_dim / kBlockM, col_factor = n_block_dim / kBlockN
+    
+    2. 优先级机制：
+       - 掩码值 >= 0：该大块需要计算，值越大优先级越高
+       - 掩码值 = -1：该大块被屏蔽，不需要计算
+       - 子块优先级：col_factor * mask_val + col_factor - 1 - block_col_offset
+         （同一大块内，列索引越小的子块优先级越高）
+    
+    3. 遍历策略：
+       - 线性扫描：从 n_block_min 到 n_block_max 顺序查找有效块
+       - 二分查找：快速定位优先级阈值对应的块范围（用于 load balancing）
+    
+    使用场景：
+    - 在 BlockSparseTileScheduler 中，每个 CUDA block 持有一个迭代器
+    - 迭代器负责遍历分配给该 CUDA block 的 Q 块行中的所有活跃 K 块
+    - 通过 find_next_valid_block() 和 advance() 实现增量遍历
+    
+    性能考虑：
+    - 掩码数据已预加载到 shared memory 或寄存器
+    - mask_val() 查询为 O(1) 操作
+    - 二分查找为 O(log N) 操作，用于快速跳过大段无效块
+    </design>
+    
+    对应 C++ 的 fwdBlockmask 类
+    """
+    
+    def __init__(
+        self,
+        blockmask_ptr: cute.Tensor,  # 指向当前 Q 块行的掩码指针
+        max_block_idx: Int32,  # 最大块索引
+        m_block_dim: Int32,  # 大块 M 维度
+        n_block_dim: Int32,  # 大块 N 维度
+        row_factor: Int32,  # M 维度转换因子
+        col_factor: Int32,  # N 维度转换因子
+        n_block_min: Int32,  # 需要处理的最小 N 块索引
+        n_block_max: Int32,  # 需要处理的最大 N 块索引
+        *,
+        loc=None,
+        ip=None
+    ):
+        """
+        初始化块稀疏掩码迭代器
+        
+        参数对应 C++ fwdBlockmask 构造函数的计算结果
+        """
+        self._blockmask_ptr = blockmask_ptr
+        self._max_block_idx = max_block_idx
+        self._m_block_dim = m_block_dim
+        self._n_block_dim = n_block_dim
+        self._row_factor = row_factor
+        self._col_factor = col_factor
+        self._n_block_min = n_block_min
+        self._n_block_max = n_block_max
+        self._current_n_block = n_block_min
+        self._loc = loc
+        self._ip = ip
+    
+    @cute.jit
+    def mask_val(self, block_col_idx: Int32, *, loc=None, ip=None) -> Int32:
+        """
+        查询指定列块的掩码值/优先级
+        
+        对应 C++ 的 mask_val() 方法
+        
+        返回值：
+            >= 0: 该块需要计算，返回值表示优先级（值越大优先级越高）
+            -1: 该块被掩码屏蔽，不需要计算
+        """
+        # 边界检查
+        if block_col_idx > self._max_block_idx or block_col_idx < 0:
+            return Int32(-1)
+        
+        # 将 CUDA kernel 块索引转换为大块索引
+        real_block_idx = block_col_idx // self._col_factor
+        block_col_offset = block_col_idx % self._col_factor
+        
+        # 从预计算的掩码中读取该大块的值
+        mask_val = self._blockmask_ptr[real_block_idx]
+        
+        # 计算子块的优先级
+        # 公式：col_factor * mask_val + col_factor - 1 - block_col_offset
+        return (
+            Int32(-1) if mask_val == -1
+            else self._col_factor * mask_val + self._col_factor - 1 - block_col_offset
+        )
+    
+    @cute.jit
+    def max_no_larger(self, target: Int32, *, loc=None, ip=None) -> Int32:
+        """
+        二分查找最大的块索引，使得其 mask_val <= target
+        
+        对应 C++ 的 max_no_larger() 方法
+        用于快速定位需要处理的块范围
+        """
+        # 空范围检查
+        if self._max_block_idx == 0:
+            return Int32(-1)
+        
+        # 二分查找
+        left = Int32(0)
+        right = self._max_block_idx - 1
+        
+        while left <= right:
+            mid = left + (right - left) // 2
+            mid_val = self.mask_val(mid, loc=loc, ip=ip)
+            
+            if mid_val > target:
+                left = mid + 1
+            else:
+                right = mid - 1
+        
+        # 验证结果
+        result_val = self.mask_val(left, loc=loc, ip=ip)
+        return left if (left < self._max_block_idx and result_val <= target) else Int32(-1)
+    
+    @cute.jit
+    def find_next_valid_block(self, *, loc=None, ip=None) -> Int32:
+        """
+        从当前位置查找下一个有效块
+        
+        返回 -1 表示没有更多有效块
+        """
+        while self._current_n_block <= self._n_block_max:
+            if self.mask_val(self._current_n_block, loc=loc, ip=ip) >= 0:
+                return self._current_n_block
+            self._current_n_block += 1
+        
+        return Int32(-1)
+    
+    def is_done(self, *, loc=None, ip=None) -> bool:
+        """检查是否完成遍历"""
+        return self._current_n_block > self._n_block_max
+    
+    def current_n_block(self, *, loc=None, ip=None) -> Int32:
+        """获取当前 N 块索引"""
+        return self._current_n_block
+    
+    def advance(self, *, loc=None, ip=None):
+        """推进到下一个块"""
+        self._current_n_block += 1
+    
+    def __extract_mlir_values__(self):
+        """提取 MLIR 值"""
+        values, self._values_pos = [], []
+        for obj in [
+            self._blockmask_ptr,
+            self._max_block_idx,
+            self._m_block_dim,
+            self._n_block_dim,
+            self._row_factor,
+            self._col_factor,
+            self._n_block_min,
+            self._n_block_max,
+            self._current_n_block,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+    
+    def __new_from_mlir_values__(self, values):
+        """从 MLIR 值重建对象"""
+        obj_list = []
+        for obj, n_items in zip(
+            [
+                self._blockmask_ptr,
+                self._max_block_idx,
+                self._m_block_dim,
+                self._n_block_dim,
+                self._row_factor,
+                self._col_factor,
+                self._n_block_min,
+                self._n_block_max,
+                self._current_n_block,
+            ],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return BlockSparseMaskIterator(*obj_list, loc=self._loc)
+
+
 @dataclass
 class BlockSparseTileSchedulerArguments(ParamsBase):
     """
-    Additional parameters for block sparse tile scheduler
+    块稀疏 Tile 调度器参数
+    
+    整合所有调度所需的参数
     """
-    mBlockmask: cute.Tensor  # Input block mask tensor (B, H, M_blocks, K_blocks)
-    # Optional: specify the maximum number of K blocks per Q block row for memory allocation
-    max_k_blocks_per_row: cutlass.Constexpr[int] = 256 
-
-class BlockSparseRowIterator:
-    def __init__(self, k_indices_ptr: cute.Tensor, num_k_blocks: Int32, *, loc=None, ip=None):
-        self._k_indices_ptr = k_indices_ptr
-        self._num_k_blocks = num_k_blocks
-        self._k_block_offset = cute.int32(0)
-        self._loc = loc
-        self._ip = ip
-
-    def is_empty_row(self, *, loc=None, ip=None) -> bool:
-        return self._num_k_blocks == 0
-
-    def current_n_block(self, *, loc=None, ip=None) -> Int32:
-        return self._k_indices_ptr[self._k_block_offset]
-
-    def advance(self, *, loc=None, ip=None):
-        self._k_block_offset += 1
-
-    def is_done(self, *, loc=None, ip=None) -> bool:
-        return self._k_block_offset >= self._num_k_blocks
-
+    # 基础调度参数（继承自 TileSchedulerArguments）
+    num_block: Int32
+    num_head: Int32
+    num_batch: Int32
+    seqlen_k: Int32
+    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+    
+    # 块稀疏专用参数
+    mBlockmask: cute.Tensor  # 块掩码张量
+    m_block_dim: cutlass.Constexpr[int]
+    n_block_dim: cutlass.Constexpr[int]
+    seqlen_q_rounded: cutlass.Constexpr[int]
+    seqlen_k_rounded: cutlass.Constexpr[int]
+    num_blocksparse_heads: cutlass.Constexpr[int]
+    mHeadMaskType: cute.Tensor  # [num_head] 每个头对应的掩码类型ID
 
 
 class BlockSparseTileScheduler:
     """
-    Block sparse tile scheduler: handles sparse attention patterns
-    Uses precomputed lookup tables to efficiently schedule sparse block computations
+    块稀疏 Tile 调度器
+    
+    结合 LUT (Look-Up Table) 方式和 mask-based iterator 方式
+    - 使用 LUT 快速定位活跃的 Q 块行
+    - 使用 mask iterator 遍历每行的 K 块
     """
     
     @dataclass
     class Params(ParamsBase):
         """
-        Scheduler parameter class, stores precomputed lookup tables
+        调度器参数
         
         Attributes:
-            total_active_rows: Total number of non-empty Q block rows, i.e., Grid x dimension
-            mRowIndices: [total_active_rows, 3], maps blockIdx.x to (m, h, b)
-            mBlockLUT: [B, H, M, max_k + 1], stores valid K block list for each Q block row
+            total_active_rows: 活跃 Q 块行总数（grid x 维度）
+            mRowIndices: [total_active_rows, 3] 映射 blockIdx.x -> (m, h, b)
+            mBlockmaskPtr: 块掩码数据指针
+            mHeadMaskType: [num_head] 每个头对应的掩码类型ID
+            m_block_dim, n_block_dim: 大块维度
+            row_factor, col_factor: 转换因子
+            seqlen_k: 实际 K 序列长度
+            seqlen_k_rounded: 向上取整的 K 序列长度
+            num_blocksparse_heads: 稀疏掩码类型数量
         """
-        total_active_rows: Int32  # Total number of non-empty Q block rows, i.e., Grid x dimension
-        mRowIndices: cute.Tensor  # [total_active_rows, 3], maps blockIdx.x to (m, h, b)
-        mBlockLUT: cute.Tensor    # [B, H, M, max_k + 1], stores valid K block list for each Q block row
-
+        total_active_rows: Int32
+        mRowIndices: cute.Tensor  # [total_active_rows, 3]
+        mBlockmaskPtr: cute.Tensor  # 块掩码数据
+        mHeadMaskType: cute.Tensor  # [num_head] 每个头对应的掩码类型ID
+        m_block_dim: Int32
+        n_block_dim: Int32
+        row_factor: Int32
+        col_factor: Int32
+        seqlen_k: Int32
+        seqlen_k_rounded: Int32
+        num_blocksparse_heads: Int32
+        num_batch: Int32
+        tile_shape_mn_0: Int32  # tile_shape_mn[0]
+        tile_shape_mn_1: Int32  # tile_shape_mn[1]
+        
+        @staticmethod
+        def create(
+            args: BlockSparseTileSchedulerArguments, *, loc=None, ip=None
+        ) -> "BlockSparseTileScheduler.Params":
+            """
+            从参数创建调度器参数
+            
+            预处理掩码数据，构建 LUT
+            """
+            import numpy as np
+            import torch
+            
+            # 计算转换因子
+            kBlockM, kBlockN = args.tile_shape_mn
+            row_factor = args.m_block_dim // kBlockM
+            col_factor = args.n_block_dim // kBlockN
+            
+            # 转换掩码到 CPU
+            blockmask_host = args.mBlockmask.cpu().numpy()
+            head_mask_type_host = args.mHeadMaskType.cpu().numpy()
+            
+            # blockmask shape: [B * num_blocksparse_heads, M_blocks, N_blocks]
+            num_batch = args.num_batch
+            num_head = args.num_head
+            num_q_blocks = args.seqlen_q_rounded // args.m_block_dim
+            
+            # 收集所有活跃的 (m, h, b) 组合
+            row_indices = []
+            
+            for b in range(num_batch):
+                for h in range(num_head):
+                    mask_type = head_mask_type_host[h]
+                    
+                    # mask_type > 0 表示使用块稀疏掩码
+                    if mask_type <= 0:
+                        continue
+                    
+                    mask_idx = b * args.num_blocksparse_heads + (mask_type - 1)
+                    
+                    for m in range(num_q_blocks):
+                        # 检查该行是否有非零元素
+                        row_mask = blockmask_host[mask_idx, m, :]
+                        if np.any(row_mask >= 0):
+                            row_indices.append((m, h, b))
+            
+            total_active_rows = len(row_indices)
+            
+            # 处理空掩码情况
+            if total_active_rows == 0:
+                row_indices.append((0, 0, 0))
+                total_active_rows = 1
+            
+            # 创建张量
+            row_indices_tensor = cute.Tensor(
+                torch.tensor(row_indices, dtype=torch.int32, device=args.mBlockmask.device),
+                name="row_indices"
+            )
+            
+            return BlockSparseTileScheduler.Params(
+                total_active_rows=Int32(total_active_rows),
+                mRowIndices=row_indices_tensor,
+                mBlockmaskPtr=args.mBlockmask,
+                mHeadMaskType=args.mHeadMaskType,
+                m_block_dim=Int32(args.m_block_dim),
+                n_block_dim=Int32(args.n_block_dim),
+                row_factor=Int32(row_factor),
+                col_factor=Int32(col_factor),
+                seqlen_k=args.seqlen_k,
+                seqlen_k_rounded=Int32(args.seqlen_k_rounded),
+                num_blocksparse_heads=Int32(args.num_blocksparse_heads),
+                num_batch=Int32(num_batch),
+                tile_shape_mn_0=Int32(kBlockM),
+                tile_shape_mn_1=Int32(kBlockN),
+            )
+    
+    def __init__(
+        self,
+        blk_coord: cute.Coord,  # (m_block, head_idx, batch_idx)
+        mask_iterator: BlockSparseMaskIterator,
+        *,
+        loc=None,
+        ip=None
+    ):
+        """初始化调度器实例"""
+        self._blk_coord = blk_coord
+        self._mask_iterator = mask_iterator
+        self._is_first_block = True
+        self._loc = loc
+        self._ip = ip
+    
     @staticmethod
-    def to_underlying_argumrnts(args: BlockSparseTileSchedulerArguments, *, loc=None, ip=None) -> Params:
-        import numpy as np
-        import torch
-
-        # Convert block mask tensor to numpy array on host
-        blockmask_host = args.mBlockmask.cpu().numpy()
-        num_batch, num_head, num_q_blocks, _ = blockmask_host.shape
-
-        row_indices = []
-        max_k = args.max_k_blocks_per_row.value
-
-        # 2. Initialize Block LUT
-        block_lut_host = np.zeros((num_batch, num_head, num_q_blocks, max_k + 1), dtype=np.int32)
-
-
-        for b in range(num_batch):
-            for h in range(num_head):
-                for m in range(num_q_blocks):
-                    k_indices = np.flatnonzero(blockmask_host[b, h, m, :])
-
-                    if k_indices.size > 0:
-                        row_indices.append((m, h, b))
-
-                        num_valid_k = min(k_indices.size, max_k)
-
-                        if k_indices.size >  max_k:
-                            print(f"Warning: more than {max_k} K blocks per Q block row for batch {b}, head {h}, Q block {m}")
-                        
-                        block_lut_host[b, h, m, 0] = num_valid_k
-
-        total_active_rows = len(row_indices)
-        if total_active_rows == 0:
-            row_indices.append((0, 0, 0))
-            total_active_rows = 1
-
-
-        row_indices_tensor = cute.Tensor(
-            torch.Tensor(row_indices, dtype=torch.int32, device=args.mBlockmask.device),
-            name = "row_indices"
-        )
-
-        block_lut_tensor = cute.Tensor(
-            torch.from_numpy(block_lut_host).to(args.mBlockmask.device),
-            name = "block_lut"
-        )
-
-        return BlockSparseTileScheduler.Params(
-            total_active_rows=total_active_rows,
-            mRowIndices=row_indices_tensor,
-            mBlockLUT=block_lut_tensor,
-        )
-
+    def to_underlying_arguments(
+        args: BlockSparseTileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
+        """转换为底层参数"""
+        return BlockSparseTileScheduler.Params.create(args, loc=loc, ip=ip)
+    
     @staticmethod
+    @cute.jit
     def create(params: Params, *, loc=None, ip=None) -> "BlockSparseTileScheduler":
         """
-        Create a BlockSparseTileScheduler instance on the device side.
+        在 device 端创建调度器实例
         
-        This method is called by each CUDA block to initialize its scheduler.
-        It retrieves the block's assigned work from the row indices lookup table
-        and sets up an iterator for the sparse K blocks.
-        
-        Args:
-            params: Scheduler parameters containing row indices and block lookup table
-            loc: MLIR location information
-            ip: MLIR insertion point
-            
-        Returns:
-            A BlockSparseTileScheduler instance configured for this CUDA block
+        每个 CUDA block 调用此方法初始化其调度器
         """
-        # Get the current CUDA block's x-dimension index
-        # This serves as the index into the row_indices array
-        block_id_x = cute.arch.block_idx_x()
-
-        # Retrieve the Q block row (m_block), head index, and batch index
-        # assigned to this CUDA block from the row_indices lookup table
+        # 获取当前 CUDA block 的 x 维度索引
+        block_id_x = cute.arch.block_idx()[0]
+        
+        # 从 LUT 中获取分配给这个 CUDA block 的工作
         m_block = params.mRowIndices[block_id_x, 0]
         head_idx = params.mRowIndices[block_id_x, 1]
         batch_idx = params.mRowIndices[block_id_x, 2]
         
-        # Create a coordinate tuple representing this block's position
-        # in the (Q block, head, batch) space
         blk_coord = cute.make_coord(m_block, head_idx, batch_idx)
-
-        # Get a pointer to this row's entry in the block lookup table (LUT)
-        # The LUT stores: [num_k_blocks, k_index_0, k_index_1, ..., k_index_max]
-        lut_entry_ptr = params.mBlockLUT.ptr(m_block, head_idx, batch_idx)
         
-        # The first element in the LUT entry is the count of valid K blocks
-        # for this Q block row
-        num_k_blocks = lut_entry_ptr[0]
+        # 计算该行对应的掩码指针
+        # 类似 C++ 中的 blockmask_ptr 计算
+        mask_type = params.mHeadMaskType[head_idx]
+        
+        # 计算掩码索引
+        # blockmask shape: [B * num_blocksparse_heads, M_blocks, N_blocks]
+        mask_batch_offset = batch_idx * params.num_blocksparse_heads + (mask_type - 1)
+        
+        # 定位到当前 Q 块行的掩码
+        blockmask_row_ptr = (
+            params.mBlockmaskPtr[mask_batch_offset, m_block // params.row_factor, :]
+        )
+        
+        # 计算最大块索引（基于实际序列长度）
+        max_block_idx = cute.ceil_div(params.seqlen_k, params.n_block_dim) * params.col_factor
+        
+        # 创建掩码迭代器
+        mask_iterator = BlockSparseMaskIterator(
+            blockmask_ptr=blockmask_row_ptr,
+            max_block_idx=max_block_idx,
+            m_block_dim=params.m_block_dim,
+            n_block_dim=params.n_block_dim,
+            row_factor=params.row_factor,
+            col_factor=params.col_factor,
+            n_block_min=Int32(0),
+            n_block_max=max_block_idx - 1,
+            loc=loc,
+            ip=ip
+        )
+        
+        return BlockSparseTileScheduler(blk_coord, mask_iterator, loc=loc, ip=ip)
+    
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        """
+        计算 CUDA grid 维度
+        
+        x 维度 = 活跃行总数（每个 CUDA block 处理一个 Q 块行）
+        """
+        return (params.total_active_rows, Int32(1), Int32(1))
+    
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        """
+        获取当前工作 tile 信息
+        
+        返回 (n_block, head_idx, batch_idx) 和有效性标志
+        """
+        # 查找下一个有效的 N 块
+        n_block = self._mask_iterator.find_next_valid_block(loc=loc, ip=ip)
+        is_valid = n_block >= 0 and self._is_first_block
+        
+        # 如果无效，返回默认值
+        if n_block < 0:
+            n_block = Int32(0)
+        
+        return cutlass.utils.WorkTileInfo(
+            (n_block, self._blk_coord[1], self._blk_coord[2]), is_valid
+        )
+    
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        """获取初始工作 tile"""
+        return self.get_current_work(loc=loc, ip=ip)
+    
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """预取下一个工作（空操作）"""
+        pass
+    
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        """
+        推进到下一个 K 块
+        
+        移动迭代器到下一个活跃的 K 块
+        """
+        self._mask_iterator.advance(loc=loc, ip=ip)
+        self._is_first_block = False
+    
+    def __extract_mlir_values__(self):
+        """提取 MLIR 值"""
+        values, self._values_pos = [], []
+        for obj in [self._blk_coord, self._mask_iterator]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+    
+    def __new_from_mlir_values__(self, values):
+        """从 MLIR 值重建对象"""
+        obj_list = []
+        for obj, n_items in zip([self._blk_coord, self._mask_iterator], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return BlockSparseTileScheduler(*obj_list, loc=self._loc)
 
-        # The remaining elements are the indices of the K blocks that are
-        # non-zero (active) in the block sparse mask for this Q block row
-        k_indices_ptr = lut_entry_ptr[1:]
-
-        # Create an iterator that will traverse the active K blocks
-        # for this Q block row during attention computation
-        row_iterator = BlockSparseRowIterator(k_indices_ptr, num_k_blocks, loc=loc, ip=ip)
-
-        # Return the scheduler instance with the block coordinate and row iterator
-        return BlockSparseTileScheduler(blk_coord, row_iterator, loc=loc, ip=ip)
