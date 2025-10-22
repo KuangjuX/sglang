@@ -1019,19 +1019,28 @@ class BlockSparseTileScheduler:
         """
         获取当前工作 tile 信息
         
-        返回 (n_block, head_idx, batch_idx) 和有效性标志
+        对于块稀疏调度器，返回的 tile_idx = (m_block, head_idx, batch_idx)
+        m_block 是固定的（分配给这个 CUDA block 的 Q 块行）
+        有效性由是否还有 K 块要处理决定
         """
-        # 查找下一个有效的 N 块
-        n_block = self._mask_iterator.find_next_valid_block(loc=loc, ip=ip)
-        is_valid = n_block >= 0 and self._is_first_block
-        
-        # 如果无效，返回默认值
-        if n_block < 0:
-            n_block = Int32(0)
+        # 检查是否还有有效的 K 块要处理
+        is_valid = not self._mask_iterator.is_done() and self._is_first_block
         
         return cutlass.utils.WorkTileInfo(
-            (n_block, self._blk_coord[1], self._blk_coord[2]), is_valid
+            (self._blk_coord[0], self._blk_coord[1], self._blk_coord[2]), is_valid
         )
+    
+    def get_m_block(self, *, loc=None, ip=None) -> Int32:
+        """获取当前处理的 Q 块行索引"""
+        return self._blk_coord[0]
+    
+    def get_head_idx(self, *, loc=None, ip=None) -> Int32:
+        """获取当前处理的头索引"""
+        return self._blk_coord[1]
+    
+    def get_batch_idx(self, *, loc=None, ip=None) -> Int32:
+        """获取当前处理的 batch 索引"""
+        return self._blk_coord[2]
     
     def initial_work_tile_info(self, *, loc=None, ip=None):
         """获取初始工作 tile"""
@@ -1046,9 +1055,13 @@ class BlockSparseTileScheduler:
         推进到下一个 K 块
         
         移动迭代器到下一个活跃的 K 块
+        注意：与其他调度器不同，这里不移动到下一个 Q 块行，
+        而是在同一个 Q 块行内移动到下一个有效的 K 块
         """
         self._mask_iterator.advance(loc=loc, ip=ip)
-        self._is_first_block = False
+        # 只在第一次后标记为非第一个块
+        if self._is_first_block:
+            self._is_first_block = False
     
     def __extract_mlir_values__(self):
         """提取 MLIR 值"""
