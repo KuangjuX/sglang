@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional, Tuple
 from dataclasses import dataclass, fields
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -15,7 +15,9 @@ from sglang.srt.sparse_attention.kernels.attention.fast_math import FastDivmod, 
 class ParamsBase:
     def __extract_mlir_values__(self):
         all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [f for f in all_fields if not isinstance(f, cutlass.Constexpr)]
+        non_constexpr_fields = [
+            f for f in all_fields if not isinstance(f, cutlass.Constexpr)
+        ]
         values, self._values_pos = [], []
         for obj in non_constexpr_fields:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -25,12 +27,18 @@ class ParamsBase:
 
     def __new_from_mlir_values__(self, values):
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, cutlass.Constexpr)}
+        constexpr_fields = {
+            n: f for n, f in all_fields.items() if isinstance(f, cutlass.Constexpr)
+        }
         non_constexpr_fields = {
             n: f for n, f in all_fields.items() if not isinstance(f, cutlass.Constexpr)
         }
-        for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
+        for (name, field), n_items in zip(
+            non_constexpr_fields.items(), self._values_pos
+        ):
+            non_constexpr_fields[name] = cutlass.new_from_mlir_values(
+                field, values[:n_items]
+            )
             values = values[n_items:]
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
@@ -54,60 +62,35 @@ class TileSchedulerArguments(ParamsBase):
 
 
 class SingleTileScheduler:
-    """
-    单tile调度器：每个CUDA block处理一个tile的工作
-    这是最简单的调度策略，每个block独立处理一个tile，不涉及持久化或负载均衡
-    """
-    
     @dataclass
     class Params(ParamsBase):
-        """
-        调度器参数类
-        存储调度所需的基本维度信息
-        """
-        num_block: Int32  # Q序列的block数量（按m_block_size划分）
-        num_head: Int32   # KV头的数量
-        num_batch: Int32  # batch大小
+        num_block: Int32
+        num_head: Int32
+        num_batch: Int32
 
         @staticmethod
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileScheduler.Params":
-            """
-            从TileSchedulerArguments创建Params实例
-            只提取必要的维度信息
-            """
-            return SingleTileScheduler.Params(args.num_block, args.num_head, args.num_batch)
+            return SingleTileScheduler.Params(
+                args.num_block, args.num_head, args.num_batch
+            )
 
     def __init__(self, blk_coord: cute.Coord, *, loc=None, ip=None):
-        """
-        初始化调度器实例
-        
-        Args:
-            blk_coord: CUDA block的坐标 (block_idx, head_idx, batch_idx)
-            loc: MLIR location信息
-            ip: MLIR insertion point
-        """
-        self._blk_coord = blk_coord  # 当前block的坐标
-        self._is_first_block = True  # 标记是否是第一个block（用于某些初始化逻辑）
+        self._blk_coord = blk_coord
+        self._is_first_block = True
         self._loc = loc
         self._ip = ip
 
     @staticmethod
-    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
-        """
-        将TileSchedulerArguments转换为调度器的底层参数
-        这是host端调用的接口
-        """
+    def to_underlying_arguments(
+        args: TileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
         return SingleTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileScheduler":
-        """
-        在device端创建调度器实例
-        获取当前CUDA block的索引作为工作坐标
-        """
-        blk_coord = cute.arch.block_idx()  # 获取当前block的3D索引
+        blk_coord = cute.arch.block_idx()
         return SingleTileScheduler(blk_coord, loc=loc, ip=ip)
 
     # called by host
@@ -118,75 +101,33 @@ class SingleTileScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        """
-        计算CUDA grid的维度
-        对于SingleTileScheduler，grid维度直接对应工作维度
-        
-        Returns:
-            (num_block, num_head, num_batch): 3D grid维度
-        """
         return params.num_block, params.num_head, params.num_batch
 
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
-        """
-        获取当前block要处理的工作tile信息
-        
-        Returns:
-            WorkTileInfo: 包含tile坐标和是否是第一个block的信息
-        """
         return cutlass.utils.WorkTileInfo(self._blk_coord, self._is_first_block)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
-        """
-        获取初始工作tile信息
-        对于SingleTileScheduler，初始工作就是当前工作
-        """
         return self.get_current_work(loc=loc, ip=ip)
 
     def prefetch_next_work(self, *, loc=None, ip=None):
-        """
-        预取下一个工作tile
-        对于SingleTileScheduler，每个block只处理一个tile，所以这是空操作
-        """
         pass
 
     def advance_to_next_work(self, *, loc=None, ip=None):
-        """
-        推进到下一个工作tile
-        对于SingleTileScheduler，只是标记不再是第一个block
-        （实际上每个block只处理一个tile，这个方法主要用于统一接口）
-        """
         self._is_first_block = False
 
     def __extract_mlir_values__(self):
-        """
-        提取MLIR值用于序列化
-        将Python对象转换为MLIR IR中的值
-        """
         values, self._values_pos = [], []
         for obj in [self._blk_coord]:
             obj_values = cutlass.extract_mlir_values(obj)
             values += obj_values
-            self._values_pos.append(len(obj_values))  # 记录每个对象的值数量
+            self._values_pos.append(len(obj_values))
         return values
 
     def __new_from_mlir_values__(self, values):
-        """
-        从MLIR值重建对象
-        用于反序列化，将MLIR IR中的值转换回Python对象
-        
-        Args:
-            values: MLIR值列表
-            
-        Returns:
-            重建的SingleTileScheduler实例
-        """
         obj_list = []
-        # 根据之前记录的位置信息，重建每个对象
         for obj, n_items in zip([self._blk_coord], self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        # 使用重建的blk_coord创建新实例
         return SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
@@ -203,7 +144,9 @@ class StaticPersistentTileScheduler:
         ) -> "StaticPersistentTileScheduler.Params":
             total_blocks = args.num_block * args.num_head * args.num_batch
             return StaticPersistentTileScheduler.Params(
-                FastDivmod.create(args.num_block), FastDivmod.create(args.num_head), total_blocks
+                FastDivmod.create(args.num_block),
+                FastDivmod.create(args.num_head),
+                total_blocks,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -213,7 +156,9 @@ class StaticPersistentTileScheduler:
         self._ip = ip
 
     @staticmethod
-    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+    def to_underlying_arguments(
+        args: TileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
         return StaticPersistentTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
@@ -263,7 +208,10 @@ class StaticPersistentTileScheduler:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos,):
+        for obj, n_items in zip(
+            [self.params, self._tile_idx],
+            self._values_pos,
+        ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
@@ -286,7 +234,9 @@ class SingleTileLPTScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileLPTScheduler.Params":
             # cute.printf(args.num_block, args.num_head, args.num_batch, args.seqlen_k, args.headdim, args.headdim_v, args.total_q, args.tile_shape_mn, args.qhead_per_kvhead_packgqa, args.element_size)
-            size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+            size_one_kv_head = (
+                args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+            )
             size_one_head = size_one_kv_head
             size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
             # Swizzle is the size of each "section". Round swizzle to a power of 2
@@ -295,7 +245,11 @@ class SingleTileLPTScheduler:
             # swizzle = 1 if size_l2 < size_one_head else (size_l2 // size_one_head)
             # Seems faster if swizzle if a power of 2
             log2_floor = lambda n: 31 - clz(n)
-            swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
+            swizzle = (
+                1
+                if size_l2 < size_one_head
+                else (1 << log2_floor(size_l2 // size_one_head))
+            )
             # swizzle = 1 if size_l2 < size_one_head else (size_l2 // size_one_head)
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
@@ -320,7 +274,9 @@ class SingleTileLPTScheduler:
         self._ip = ip
 
     @staticmethod
-    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+    def to_underlying_arguments(
+        args: TileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
         return SingleTileLPTScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
@@ -387,8 +343,6 @@ class SingleTileLPTScheduler:
 
 
 class SingleTileVarlenScheduler:
-
-
     @dataclass
     class Params(ParamsBase):
         num_head: Int32
@@ -407,10 +361,14 @@ class SingleTileVarlenScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileVarlenScheduler.Params":
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
-            max_kvblock_in_l2 = size_l2 // ((args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1])
-            assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
-                "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
+            max_kvblock_in_l2 = size_l2 // (
+                (args.headdim + args.headdim_v)
+                * args.element_size
+                * args.tile_shape_mn[1]
             )
+            assert (
+                args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None
+            ), "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             return SingleTileVarlenScheduler.Params(
                 num_head=args.num_head,
                 num_batch=args.num_batch,
@@ -431,7 +389,9 @@ class SingleTileVarlenScheduler:
         self._ip = ip
 
     @staticmethod
-    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+    def to_underlying_arguments(
+        args: TileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
         return SingleTileVarlenScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
@@ -482,7 +442,9 @@ class SingleTileVarlenScheduler:
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
         num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
         # Total number of blocks for the next 31 batches
-        m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
+        m_blocks_in_group = cute.arch.shuffle_sync(
+            num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
+        )
         # Same for all lanes
         group_end_tile = m_blocks_in_group * params.num_head
         # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
@@ -510,32 +472,62 @@ class SingleTileVarlenScheduler:
             # that is greater than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
-                    group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx
+                    group_start_tile + num_m_blocks_cumulative * params.num_head
+                    <= next_tile_idx
                 )
             )
             batch_idx += batch_idx_in_group
             num_m_blocks_prev_lane = (
                 0
                 if batch_idx_in_group == 0
-                else cute.arch.shuffle_sync(num_m_blocks_cumulative, batch_idx_in_group - 1)
+                else cute.arch.shuffle_sync(
+                    num_m_blocks_cumulative, batch_idx_in_group - 1
+                )
             )
             num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
-            mh_block = next_tile_idx - group_start_tile - num_m_blocks_prev_lane * params.num_head
+            mh_block = (
+                next_tile_idx
+                - group_start_tile
+                - num_m_blocks_prev_lane * params.num_head
+            )
             if cutlass.const_expr(params.lpt):
                 # This is a version of the SingleTileLPTScheduler, complicated by the fact that
                 # the seqlen can vary per batch.
                 # TODO: is there any case where num_m_blocks is 0?
                 # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
-                num_n_blocks = num_m_blocks * params.tile_shape_mn[0] // params.qhead_per_kvhead_packgqa // params.tile_shape_mn[1]
+                num_n_blocks = (
+                    num_m_blocks
+                    * params.tile_shape_mn[0]
+                    // params.qhead_per_kvhead_packgqa
+                    // params.tile_shape_mn[1]
+                )
                 # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_n_blocks, 1), self.num_head)
                 # Seems faster to have this be a power of 2
-                nheads_in_l2 = 16 if num_n_blocks * 16 <= params.max_kvblock_in_l2 else (8 if num_n_blocks * 8 <= params.max_kvblock_in_l2 else (4 if num_n_blocks * 4 <= params.max_kvblock_in_l2 else (2 if num_n_blocks * 2 <= params.max_kvblock_in_l2 else 1)))
+                nheads_in_l2 = (
+                    16
+                    if num_n_blocks * 16 <= params.max_kvblock_in_l2
+                    else (
+                        8
+                        if num_n_blocks * 8 <= params.max_kvblock_in_l2
+                        else (
+                            4
+                            if num_n_blocks * 4 <= params.max_kvblock_in_l2
+                            else (
+                                2 if num_n_blocks * 2 <= params.max_kvblock_in_l2 else 1
+                            )
+                        )
+                    )
+                )
                 nheads_in_l2 = min(nheads_in_l2, params.num_head)
                 mh_in_l2 = nheads_in_l2 * num_m_blocks
                 section_idx = mh_block // mh_in_l2
                 l2_mod = mh_block - section_idx * mh_in_l2
                 # Deal with tail section
-                nheads_in_this_section = nheads_in_l2 if nheads_in_l2 * (section_idx + 1) <= params.num_head else params.num_head - section_idx * nheads_in_l2
+                nheads_in_this_section = (
+                    nheads_in_l2
+                    if nheads_in_l2 * (section_idx + 1) <= params.num_head
+                    else params.num_head - section_idx * nheads_in_l2
+                )
                 block = l2_mod // nheads_in_this_section
                 head_idx_residual = l2_mod - block * nheads_in_this_section
                 head_idx = section_idx * nheads_in_l2 + head_idx_residual
@@ -569,514 +561,10 @@ class SingleTileVarlenScheduler:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos,
-        ):
-            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return SingleTileVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
-
-
-
-@dataclass
-class BlockSparseMaskArguments(ParamsBase):
-    """
-    块稀疏掩码参数
-    
-    与 C++ fwdBlockmask 对应，存储预计算的块稀疏掩码信息
-    """
-    mBlockmask: cute.Tensor  # 块掩码张量 [B*num_heads, M_blocks, N_blocks]，存储优先级值
-    m_block_dim: cutlass.Constexpr[int]  # 大块的 M 维度
-    n_block_dim: cutlass.Constexpr[int]  # 大块的 N 维度
-    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]  # CUDA kernel 块大小 (kBlockM, kBlockN)
-    seqlen_q_rounded: cutlass.Constexpr[int]  # 向上取整的 Q 序列长度
-    seqlen_k_rounded: cutlass.Constexpr[int]  # 向上取整的 K 序列长度
-    num_blocksparse_heads: cutlass.Constexpr[int]  # 稀疏掩码类型数量
-
-
-class BlockSparseMaskIterator:
-    """
-    块稀疏掩码迭代器
-    
-    <design>
-    设计目标：
-    - 提供基于预计算掩码的高效块遍历功能
-    - 支持优先级调度和二分查找优化
-    - 在 device 端运行，最小化内存访问和分支开销
-    
-    核心概念：
-    1. 两级块结构：
-       - 大块 (m_block_dim x n_block_dim)：预计算掩码的粒度
-       - 小块 (kBlockM x kBlockN)：CUDA kernel tile 的粒度
-       - 转换因子：row_factor = m_block_dim / kBlockM, col_factor = n_block_dim / kBlockN
-    
-    2. 优先级机制：
-       - 掩码值 >= 0：该大块需要计算，值越大优先级越高
-       - 掩码值 = -1：该大块被屏蔽，不需要计算
-       - 子块优先级：col_factor * mask_val + col_factor - 1 - block_col_offset
-         （同一大块内，列索引越小的子块优先级越高）
-    
-    3. 遍历策略：
-       - 线性扫描：从 n_block_min 到 n_block_max 顺序查找有效块
-       - 二分查找：快速定位优先级阈值对应的块范围（用于 load balancing）
-    
-    使用场景：
-    - 在 BlockSparseTileScheduler 中，每个 CUDA block 持有一个迭代器
-    - 迭代器负责遍历分配给该 CUDA block 的 Q 块行中的所有活跃 K 块
-    - 通过 find_next_valid_block() 和 advance() 实现增量遍历
-    
-    性能考虑：
-    - 掩码数据已预加载到 shared memory 或寄存器
-    - mask_val() 查询为 O(1) 操作
-    - 二分查找为 O(log N) 操作，用于快速跳过大段无效块
-    </design>
-    
-    对应 C++ 的 fwdBlockmask 类
-    """
-    
-    def __init__(
-        self,
-        blockmask_ptr: cute.Tensor,  # 指向当前 Q 块行的掩码指针
-        max_block_idx: Int32,  # 最大块索引
-        m_block_dim: Int32,  # 大块 M 维度
-        n_block_dim: Int32,  # 大块 N 维度
-        row_factor: Int32,  # M 维度转换因子
-        col_factor: Int32,  # N 维度转换因子
-        n_block_min: Int32,  # 需要处理的最小 N 块索引
-        n_block_max: Int32,  # 需要处理的最大 N 块索引
-        *,
-        loc=None,
-        ip=None
-    ):
-        """
-        初始化块稀疏掩码迭代器
-        
-        参数对应 C++ fwdBlockmask 构造函数的计算结果
-        """
-        self._blockmask_ptr = blockmask_ptr
-        self._max_block_idx = max_block_idx
-        self._m_block_dim = m_block_dim
-        self._n_block_dim = n_block_dim
-        self._row_factor = row_factor
-        self._col_factor = col_factor
-        self._n_block_min = n_block_min
-        self._n_block_max = n_block_max
-        self._current_n_block = n_block_min
-        self._loc = loc
-        self._ip = ip
-    
-    @cute.jit
-    def mask_val(self, block_col_idx: Int32, *, loc=None, ip=None) -> Int32:
-        """
-        查询指定列块的掩码值/优先级
-        
-        对应 C++ 的 mask_val() 方法
-        
-        返回值：
-            >= 0: 该块需要计算，返回值表示优先级（值越大优先级越高）
-            -1: 该块被掩码屏蔽，不需要计算
-        """
-        # 边界检查
-        if block_col_idx > self._max_block_idx or block_col_idx < 0:
-            return Int32(-1)
-        
-        # 将 CUDA kernel 块索引转换为大块索引
-        real_block_idx = block_col_idx // self._col_factor
-        block_col_offset = block_col_idx % self._col_factor
-        
-        # 从预计算的掩码中读取该大块的值
-        mask_val = self._blockmask_ptr[real_block_idx]
-        
-        # 计算子块的优先级
-        # 公式：col_factor * mask_val + col_factor - 1 - block_col_offset
-        return (
-            Int32(-1) if mask_val == -1
-            else self._col_factor * mask_val + self._col_factor - 1 - block_col_offset
-        )
-    
-    @cute.jit
-    def max_no_larger(self, target: Int32, *, loc=None, ip=None) -> Int32:
-        """
-        二分查找最大的块索引，使得其 mask_val <= target
-        
-        对应 C++ 的 max_no_larger() 方法
-        用于快速定位需要处理的块范围
-        """
-        # 空范围检查
-        if self._max_block_idx == 0:
-            return Int32(-1)
-        
-        # 二分查找
-        left = Int32(0)
-        right = self._max_block_idx - 1
-        
-        while left <= right:
-            mid = left + (right - left) // 2
-            mid_val = self.mask_val(mid, loc=loc, ip=ip)
-            
-            if mid_val > target:
-                left = mid + 1
-            else:
-                right = mid - 1
-        
-        # 验证结果
-        result_val = self.mask_val(left, loc=loc, ip=ip)
-        return left if (left < self._max_block_idx and result_val <= target) else Int32(-1)
-    
-    @cute.jit
-    def find_next_valid_block(self, *, loc=None, ip=None) -> Int32:
-        """
-        从当前位置查找下一个有效块
-        
-        返回 -1 表示没有更多有效块
-        """
-        while self._current_n_block <= self._n_block_max:
-            if self.mask_val(self._current_n_block, loc=loc, ip=ip) >= 0:
-                return self._current_n_block
-            self._current_n_block += 1
-        
-        return Int32(-1)
-    
-    def is_done(self, *, loc=None, ip=None) -> bool:
-        """检查是否完成遍历"""
-        return self._current_n_block > self._n_block_max
-    
-    def current_n_block(self, *, loc=None, ip=None) -> Int32:
-        """获取当前 N 块索引"""
-        return self._current_n_block
-    
-    def advance(self, *, loc=None, ip=None):
-        """推进到下一个块"""
-        self._current_n_block += 1
-    
-    def __extract_mlir_values__(self):
-        """提取 MLIR 值"""
-        values, self._values_pos = [], []
-        for obj in [
-            self._blockmask_ptr,
-            self._max_block_idx,
-            self._m_block_dim,
-            self._n_block_dim,
-            self._row_factor,
-            self._col_factor,
-            self._n_block_min,
-            self._n_block_max,
-            self._current_n_block,
-        ]:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-    
-    def __new_from_mlir_values__(self, values):
-        """从 MLIR 值重建对象"""
-        obj_list = []
         for obj, n_items in zip(
-            [
-                self._blockmask_ptr,
-                self._max_block_idx,
-                self._m_block_dim,
-                self._n_block_dim,
-                self._row_factor,
-                self._col_factor,
-                self._n_block_min,
-                self._n_block_max,
-                self._current_n_block,
-            ],
+            [self.params, self._tile_idx],
             self._values_pos,
         ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return BlockSparseMaskIterator(*obj_list, loc=self._loc)
-
-
-@dataclass
-class BlockSparseTileSchedulerArguments(ParamsBase):
-    """
-    块稀疏 Tile 调度器参数
-    
-    整合所有调度所需的参数
-    """
-    # 基础调度参数（继承自 TileSchedulerArguments）
-    num_block: Int32
-    num_head: Int32
-    num_batch: Int32
-    seqlen_k: Int32
-    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
-    
-    # 块稀疏专用参数
-    mBlockmask: cute.Tensor  # 块掩码张量
-    m_block_dim: cutlass.Constexpr[int]
-    n_block_dim: cutlass.Constexpr[int]
-    seqlen_q_rounded: cutlass.Constexpr[int]
-    seqlen_k_rounded: cutlass.Constexpr[int]
-    num_blocksparse_heads: cutlass.Constexpr[int]
-    mHeadMaskType: cute.Tensor  # [num_head] 每个头对应的掩码类型ID
-
-
-class BlockSparseTileScheduler:
-    """
-    块稀疏 Tile 调度器
-    
-    结合 LUT (Look-Up Table) 方式和 mask-based iterator 方式
-    - 使用 LUT 快速定位活跃的 Q 块行
-    - 使用 mask iterator 遍历每行的 K 块
-    """
-    
-    @dataclass
-    class Params(ParamsBase):
-        """
-        调度器参数
-        
-        Attributes:
-            total_active_rows: 活跃 Q 块行总数（grid x 维度）
-            mRowIndices: [total_active_rows, 3] 映射 blockIdx.x -> (m, h, b)
-            mBlockmaskPtr: 块掩码数据指针
-            mHeadMaskType: [num_head] 每个头对应的掩码类型ID
-            m_block_dim, n_block_dim: 大块维度
-            row_factor, col_factor: 转换因子
-            seqlen_k: 实际 K 序列长度
-            seqlen_k_rounded: 向上取整的 K 序列长度
-            num_blocksparse_heads: 稀疏掩码类型数量
-        """
-        total_active_rows: Int32
-        mRowIndices: cute.Tensor  # [total_active_rows, 3]
-        mBlockmaskPtr: cute.Tensor  # 块掩码数据
-        mHeadMaskType: cute.Tensor  # [num_head] 每个头对应的掩码类型ID
-        m_block_dim: Int32
-        n_block_dim: Int32
-        row_factor: Int32
-        col_factor: Int32
-        seqlen_k: Int32
-        seqlen_k_rounded: Int32
-        num_blocksparse_heads: Int32
-        num_batch: Int32
-        tile_shape_mn_0: Int32  # tile_shape_mn[0]
-        tile_shape_mn_1: Int32  # tile_shape_mn[1]
-        
-        @staticmethod
-        def create(
-            args: BlockSparseTileSchedulerArguments, *, loc=None, ip=None
-        ) -> "BlockSparseTileScheduler.Params":
-            """
-            从参数创建调度器参数
-            
-            预处理掩码数据，构建 LUT
-            """
-            import numpy as np
-            import torch
-            
-            # 计算转换因子
-            kBlockM, kBlockN = args.tile_shape_mn
-            row_factor = args.m_block_dim // kBlockM
-            col_factor = args.n_block_dim // kBlockN
-            
-            # 转换掩码到 CPU
-            blockmask_host = args.mBlockmask.cpu().numpy()
-            head_mask_type_host = args.mHeadMaskType.cpu().numpy()
-            
-            # blockmask shape: [B * num_blocksparse_heads, M_blocks, N_blocks]
-            num_batch = args.num_batch
-            num_head = args.num_head
-            num_q_blocks = args.seqlen_q_rounded // args.m_block_dim
-            
-            # 收集所有活跃的 (m, h, b) 组合
-            row_indices = []
-            
-            for b in range(num_batch):
-                for h in range(num_head):
-                    mask_type = head_mask_type_host[h]
-                    
-                    # mask_type > 0 表示使用块稀疏掩码
-                    if mask_type <= 0:
-                        continue
-                    
-                    mask_idx = b * args.num_blocksparse_heads + (mask_type - 1)
-                    
-                    for m in range(num_q_blocks):
-                        # 检查该行是否有非零元素
-                        row_mask = blockmask_host[mask_idx, m, :]
-                        if np.any(row_mask >= 0):
-                            row_indices.append((m, h, b))
-            
-            total_active_rows = len(row_indices)
-            
-            # 处理空掩码情况
-            if total_active_rows == 0:
-                row_indices.append((0, 0, 0))
-                total_active_rows = 1
-            
-            # 创建张量
-            row_indices_tensor = cute.Tensor(
-                torch.tensor(row_indices, dtype=torch.int32, device=args.mBlockmask.device),
-                name="row_indices"
-            )
-            
-            return BlockSparseTileScheduler.Params(
-                total_active_rows=Int32(total_active_rows),
-                mRowIndices=row_indices_tensor,
-                mBlockmaskPtr=args.mBlockmask,
-                mHeadMaskType=args.mHeadMaskType,
-                m_block_dim=Int32(args.m_block_dim),
-                n_block_dim=Int32(args.n_block_dim),
-                row_factor=Int32(row_factor),
-                col_factor=Int32(col_factor),
-                seqlen_k=args.seqlen_k,
-                seqlen_k_rounded=Int32(args.seqlen_k_rounded),
-                num_blocksparse_heads=Int32(args.num_blocksparse_heads),
-                num_batch=Int32(num_batch),
-                tile_shape_mn_0=Int32(kBlockM),
-                tile_shape_mn_1=Int32(kBlockN),
-            )
-    
-    def __init__(
-        self,
-        blk_coord: cute.Coord,  # (m_block, head_idx, batch_idx)
-        mask_iterator: BlockSparseMaskIterator,
-        *,
-        loc=None,
-        ip=None
-    ):
-        """初始化调度器实例"""
-        self._blk_coord = blk_coord
-        self._mask_iterator = mask_iterator
-        self._is_first_block = True
-        self._loc = loc
-        self._ip = ip
-    
-    @staticmethod
-    def to_underlying_arguments(
-        args: BlockSparseTileSchedulerArguments, *, loc=None, ip=None
-    ) -> Params:
-        """转换为底层参数"""
-        return BlockSparseTileScheduler.Params.create(args, loc=loc, ip=ip)
-    
-    @staticmethod
-    @cute.jit
-    def create(params: Params, *, loc=None, ip=None) -> "BlockSparseTileScheduler":
-        """
-        在 device 端创建调度器实例
-        
-        每个 CUDA block 调用此方法初始化其调度器
-        """
-        # 获取当前 CUDA block 的 x 维度索引
-        block_id_x = cute.arch.block_idx()[0]
-        
-        # 从 LUT 中获取分配给这个 CUDA block 的工作
-        m_block = params.mRowIndices[block_id_x, 0]
-        head_idx = params.mRowIndices[block_id_x, 1]
-        batch_idx = params.mRowIndices[block_id_x, 2]
-        
-        blk_coord = cute.make_coord(m_block, head_idx, batch_idx)
-        
-        # 计算该行对应的掩码指针
-        # 类似 C++ 中的 blockmask_ptr 计算
-        mask_type = params.mHeadMaskType[head_idx]
-        
-        # 计算掩码索引
-        # blockmask shape: [B * num_blocksparse_heads, M_blocks, N_blocks]
-        mask_batch_offset = batch_idx * params.num_blocksparse_heads + (mask_type - 1)
-        
-        # 定位到当前 Q 块行的掩码
-        blockmask_row_ptr = (
-            params.mBlockmaskPtr[mask_batch_offset, m_block // params.row_factor, :]
-        )
-        
-        # 计算最大块索引（基于实际序列长度）
-        max_block_idx = cute.ceil_div(params.seqlen_k, params.n_block_dim) * params.col_factor
-        
-        # 创建掩码迭代器
-        mask_iterator = BlockSparseMaskIterator(
-            blockmask_ptr=blockmask_row_ptr,
-            max_block_idx=max_block_idx,
-            m_block_dim=params.m_block_dim,
-            n_block_dim=params.n_block_dim,
-            row_factor=params.row_factor,
-            col_factor=params.col_factor,
-            n_block_min=Int32(0),
-            n_block_max=max_block_idx - 1,
-            loc=loc,
-            ip=ip
-        )
-        
-        return BlockSparseTileScheduler(blk_coord, mask_iterator, loc=loc, ip=ip)
-    
-    @staticmethod
-    def get_grid_shape(
-        params: Params,
-        *,
-        loc=None,
-        ip=None,
-    ) -> Tuple[Int32, Int32, Int32]:
-        """
-        计算 CUDA grid 维度
-        
-        x 维度 = 活跃行总数（每个 CUDA block 处理一个 Q 块行）
-        """
-        return (params.total_active_rows, Int32(1), Int32(1))
-    
-    @cute.jit
-    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
-        """
-        获取当前工作 tile 信息
-        
-        对于块稀疏调度器，返回的 tile_idx = (m_block, head_idx, batch_idx)
-        m_block 是固定的（分配给这个 CUDA block 的 Q 块行）
-        有效性由是否还有 K 块要处理决定
-        """
-        # 检查是否还有有效的 K 块要处理
-        is_valid = not self._mask_iterator.is_done() and self._is_first_block
-        
-        return cutlass.utils.WorkTileInfo(
-            (self._blk_coord[0], self._blk_coord[1], self._blk_coord[2]), is_valid
-        )
-    
-    def get_m_block(self, *, loc=None, ip=None) -> Int32:
-        """获取当前处理的 Q 块行索引"""
-        return self._blk_coord[0]
-    
-    def get_head_idx(self, *, loc=None, ip=None) -> Int32:
-        """获取当前处理的头索引"""
-        return self._blk_coord[1]
-    
-    def get_batch_idx(self, *, loc=None, ip=None) -> Int32:
-        """获取当前处理的 batch 索引"""
-        return self._blk_coord[2]
-    
-    def initial_work_tile_info(self, *, loc=None, ip=None):
-        """获取初始工作 tile"""
-        return self.get_current_work(loc=loc, ip=ip)
-    
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        """预取下一个工作（空操作）"""
-        pass
-    
-    def advance_to_next_work(self, *, loc=None, ip=None):
-        """
-        推进到下一个 K 块
-        
-        移动迭代器到下一个活跃的 K 块
-        注意：与其他调度器不同，这里不移动到下一个 Q 块行，
-        而是在同一个 Q 块行内移动到下一个有效的 K 块
-        """
-        self._mask_iterator.advance(loc=loc, ip=ip)
-        # 只在第一次后标记为非第一个块
-        if self._is_first_block:
-            self._is_first_block = False
-    
-    def __extract_mlir_values__(self):
-        """提取 MLIR 值"""
-        values, self._values_pos = [], []
-        for obj in [self._blk_coord, self._mask_iterator]:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-    
-    def __new_from_mlir_values__(self, values):
-        """从 MLIR 值重建对象"""
-        obj_list = []
-        for obj, n_items in zip([self._blk_coord, self._mask_iterator], self._values_pos):
-            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return BlockSparseTileScheduler(*obj_list, loc=self._loc)
-
+        return SingleTileVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
