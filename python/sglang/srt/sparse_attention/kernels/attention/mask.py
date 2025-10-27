@@ -250,7 +250,8 @@ class AttentionMask:
                         else acc_S[i]
                     )
 
-    def _apply_streaming_mask(
+    @cute.jit
+    def apply_streaming_mask(
         self, 
         acc_S: cute.Tensor,
         m_block: cutlass.Int32,
@@ -289,6 +290,7 @@ class AttentionMask:
                 row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
             else:
                 # TODO(KuangjuX): Packed GQA Support
+                row_idx = 0
                 
             col_limit_right = row_idx + local_row_offset_right
             col_limit_left = row_idx + local_row_offset_left
@@ -301,12 +303,13 @@ class AttentionMask:
 
                 should_mask = True
 
-                if col_idx < sink_col_limit:
-                    should_mask = False
+                is_in_sink = col_idx < sink_col_limit
 
-                if col_idx >= col_limit_left or col_idx < col_limit_right:
+                is_causal = col_idx < col_limit_right
+                is_in_window = col_idx >= col_limit_left
+
+                if is_in_sink or (is_causal and is_in_window):
                     should_mask = False
 
                 if should_mask:
                     acc_S_mn[r, c] = -cutlass.Float32.inf
-            
