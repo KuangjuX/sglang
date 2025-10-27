@@ -15,96 +15,96 @@ def construct_streaming_mask(
     device: torch.device = torch.device('cpu'),
 ):
     """
-    构建用于 Streaming Attention 的注意力掩码。
+    Construct attention mask for Streaming Attention.
 
-    该掩码结合了"注意力汇聚（sink）"和"局部滑动窗口（local window）"。
-    一个查询 token `i` 可以关注：
-    1. 序列最开始的 `sink_size` 个 token。
-    2. 在其局部窗口内的 `local_size` 个 token（包括自身）。
+    This mask combines "attention sink" and "local sliding window".
+    A query token `i` can attend to:
+    1. The first `sink_size` tokens at the beginning of the sequence.
+    2. `local_size` tokens within its local window (including itself).
 
     Args:
-        seqlen_q (int): 查询序列的长度。
-        seqlen_k (int): 键序列的长度。
-        sink_size (int): 注意力汇聚区的大小。
-        local_size (int): 局部滑动窗口的大小。
-        is_causal (bool): 是否应用因果约束。
-        query_padding_mask (Optional[torch.Tensor]): 查询序列的填充掩码，形状为 (seqlen_q,)。
-                                                     True 表示有效 token，False 表示 padding。
-        key_padding_mask (Optional[torch.Tensor]): 键序列的填充掩码，形状为 (seqlen_k,)。
-                                                   True 表示有效 token，False 表示 padding。
-        device (torch.device): 张量所在的设备。
+        seqlen_q (int): Length of the query sequence.
+        seqlen_k (int): Length of the key sequence.
+        sink_size (int): Size of the attention sink region.
+        local_size (int): Size of the local sliding window.
+        is_causal (bool): Whether to apply causal constraint.
+        query_padding_mask (Optional[torch.Tensor]): Padding mask for query sequence, shape (seqlen_q,).
+                                                     True indicates valid token, False indicates padding.
+        key_padding_mask (Optional[torch.Tensor]): Padding mask for key sequence, shape (seqlen_k,).
+                                                   True indicates valid token, False indicates padding.
+        device (torch.device): Device where the tensor resides.
 
     Returns:
-        torch.Tensor: 一个布尔类型的注意力掩码张量，形状为 (seqlen_q, seqlen_k)。
-                      `True` 表示该位置需要被掩码（忽略），`False` 表示保留。
+        torch.Tensor: A boolean attention mask tensor with shape (seqlen_q, seqlen_k).
+                      `True` indicates the position should be masked (ignored), `False` indicates retained.
     """
     assert sink_size >= 0, "sink_size must be greater than or equal to 0"
     assert local_size >= 1, "local_size must be greater than 0"
 
-    # 创建行索引和列索引，用于构建注意力矩阵的坐标网格
-    # row_idx 代表查询 token 的位置 (i)
-    # rearrange 将其形状从 (s,) 变为 (s, 1)，以便与 col_idx 进行广播操作
+    # Create row and column indices to build coordinate grid for attention matrix
+    # row_idx represents query token position (i)
+    # rearrange changes shape from (s,) to (s, 1) for broadcasting with col_idx
     row_idx = rearrange(torch.arange(seqlen_q, device=device), "s -> s 1")
 
-    # col_idx 代表键 token 的位置 (j)
+    # col_idx represents key token position (j)
     col_idx = torch.arange(seqlen_k, device=device)
 
-    # 只有在需要因果约束时，才进行复杂的掩码计算
+    # Only perform complex mask computation when causal constraint is needed
     if is_causal:
-        # --- 处理带有填充（Padding）的情况 ---
-        # 如果提供了填充掩码，我们需要计算每个序列的实际长度，
-        # 因为因果关系和窗口位置是相对于实际 token 而言的，而不是固定的序列长度。
+        # --- Handle cases with padding ---
+        # If padding masks are provided, we need to compute the actual length of each sequence,
+        # because causal relationships and window positions are relative to actual tokens, not fixed sequence length.
         if query_padding_mask is not None or key_padding_mask is not None:
-            # sk 是键序列的实际长度。如果没提供掩码，就用 seqlen_k。
-            # 否则，通过对掩码求和得到实际长度 (假设真实 token 为 1，padding 为 0)。
-            # 注意：padding_mask 现在是单个序列的掩码，形状为 (seqlen,)，而非批次级别
+            # sk is the actual length of the key sequence. If no mask is provided, use seqlen_k.
+            # Otherwise, get actual length by summing the mask (assuming real tokens are 1, padding is 0).
+            # Note: padding_mask is now a mask for a single sequence with shape (seqlen,), not batch-level
             sk = (
                 seqlen_k
                 if key_padding_mask is None 
                 else key_padding_mask.sum().item()
             )
-            # sq 是查询序列的实际长度，逻辑同上。
+            # sq is the actual length of the query sequence, same logic as above.
             sq = (
                 seqlen_q
                 if query_padding_mask is None
                 else query_padding_mask.sum().item()
             )
-        # 处理没有填充的简单情况 (seqlen_q, seqlen_k)
+        # Handle simple case without padding (seqlen_q, seqlen_k)
         else:
             sk = seqlen_k
             sq = seqlen_q
 
         if query_padding_mask is not None or key_padding_mask is not None:
-            # 对于带填充的情况，需要调整因果关系和窗口边界
-            # 因为实际序列可能比填充后的长度短
+            # For cases with padding, need to adjust causal relationship and window boundaries
+            # because actual sequence may be shorter than padded length
             beyond_causal = col_idx > torch.minimum(row_idx + sk - sq, torch.tensor(sk, device=device))
             outside_window = torch.logical_and(
                 col_idx < row_idx + sk - sq - (local_size - 1),
                 col_idx >= sink_size
             )
         else:
-            # 没有填充的简化逻辑
-            # 条件1：因果性掩码
-            # 键的位置 `j` (col_idx) 不能大于查询的位置 `i` (row_idx)。
-            # 这会创建一个上三角矩阵（对角线之上为 True）。
-            # beyond_causal 的形状是 (seqlen_q, seqlen_k)
-            # 因为 row_idx 的形状是 (seqlen_q, 1)，col_idx 的形状是 (seqlen_k,)
-            # 通过广播机制，比较操作会产生 (seqlen_q, seqlen_k) 的布尔张量
+            # Simplified logic without padding
+            # Condition 1: Causal mask
+            # Key position `j` (col_idx) cannot be greater than query position `i` (row_idx).
+            # This creates an upper triangular matrix (True above diagonal).
+            # beyond_causal has shape (seqlen_q, seqlen_k)
+            # because row_idx has shape (seqlen_q, 1), col_idx has shape (seqlen_k,)
+            # Through broadcasting, the comparison produces a boolean tensor of shape (seqlen_q, seqlen_k)
             beyond_causal = col_idx > row_idx 
 
-            # 条件2：窗口外掩码
-            # `row_idx - (local_size - 1)` 是滑动窗口的左边界。
-            # 例如，对于查询 i=7, local_size=3, 窗口是 [5, 6, 7]。左边界是 7-(3-1)=5。
-            # 任何 col_idx < 5 的 token 都在窗口之外。
-            # `col_idx >= sink_size` 同样是豁免汇聚区的 token。
+            # Condition 2: Outside window mask
+            # `row_idx - (local_size - 1)` is the left boundary of the sliding window.
+            # For example, for query i=7, local_size=3, window is [5, 6, 7]. Left boundary is 7-(3-1)=5.
+            # Any token with col_idx < 5 is outside the window.
+            # `col_idx >= sink_size` exempts tokens in the sink region.
             outside_window = torch.logical_and(
                 col_idx < row_idx - (local_size - 1),
                 col_idx >= sink_size
             )
         mask = torch.logical_or(beyond_causal, outside_window)
 
-    # 如果不是因果模式（例如，BERT 那样的编码器），则不应用任何掩码。
-    # 创建一个全为 False 的掩码，允许所有 token 相互关注。
+    # If not causal mode (e.g., encoder like BERT), don't apply any mask.
+    # Create an all-False mask, allowing all tokens to attend to each other.
     else:
         mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=device)
 
@@ -121,7 +121,8 @@ def block_streaming_attention_ref(
     max_seqlen_q: int,
     max_seqlen_k: int,
     head_mask_type: torch.Tensor,
-    streaming_info: torch.Tensor,
+    sink_size: int,
+    local_size: int,
     p_dropout: float = 0.0,
     softmax_scale: Optional[float] = None,
     is_causal: bool = True,
@@ -131,31 +132,31 @@ def block_streaming_attention_ref(
     return_attn_probs: bool = False,
 ):
     """
-    实现一个块状的、支持混合模式（密集、流式）的注意力机制。
+    Implement block-based attention mechanism supporting mixed modes (dense, streaming).
 
     Args:
-        q, k, v (torch.Tensor): 输入的查询、键、值张量。它们是批处理中所有序列拼接后的结果。
-                                形状为 (total_tokens, num_heads, head_dim)。
-        cu_seqlens_q, cu_seqlens_k (torch.Tensor): 累积序列长度。
-                                                  例如, 对于长度为 [L1, L2] 的批处理, cu_seqlens 为 [0, L1, L1+L2]。
-                                                  用于从 q, k, v 中切分出每个序列。
-        max_seqlen_q, max_seqlen_k (int): 批处理中最大的查询/键序列长度。
-        head_mask_type (torch.Tensor): 一个形状为 (num_heads,) 的张量，决定每个头的注意力类型。
+        q, k, v (torch.Tensor): Input query, key, value tensors. They are concatenated results of all sequences in the batch.
+                                Shape is (total_tokens, num_heads, head_dim).
+        cu_seqlens_q, cu_seqlens_k (torch.Tensor): Cumulative sequence lengths.
+                                                  For example, for a batch with lengths [L1, L2], cu_seqlens is [0, L1, L1+L2].
+                                                  Used to slice each sequence from q, k, v.
+        max_seqlen_q, max_seqlen_k (int): Maximum query/key sequence length in the batch.
+        head_mask_type (torch.Tensor): A tensor of shape (num_heads,) determining attention type for each head.
                                        0: Dense Attention
                                        <0: Streaming Attention
-                                       >0: Block Sparse Attention (此处未实现)
-        streaming_info (torch.Tensor): 一个形状为 (num_heads * 2,) 的扁平化张量，
-                                       存储每个头的 [sink_size, local_size] 对。
-        p_dropout (float): Dropout 概率。
-        softmax_scale (Optional[float]): Softmax 的缩放因子。
-        is_causal (bool): 是否应用因果掩码。
-        ... (其他参数)
+                                       >0: Block Sparse Attention (not implemented here)
+        sink_size (int): Size of the attention sink region.
+        local_size (int): Size of the local sliding window.
+        p_dropout (float): Dropout probability.
+        softmax_scale (Optional[float]): Scaling factor for softmax.
+        is_causal (bool): Whether to apply causal mask.
+        ... (other parameters)
     """
     device = q.device
     total_q, num_heads, head_dim = q.shape
     _, num_heads_k, _ = k.shape
     
-    # batch_size 可以从 cu_seqlens 的长度推断出来
+    # batch_size can be inferred from the length of cu_seqlens
     batch_size = cu_seqlens_q.shape[0] - 1
 
     if softmax_scale is None:
@@ -163,40 +164,40 @@ def block_streaming_attention_ref(
 
     attn_weight_lists = [] if return_attn_probs else None
 
-    # --- 2. 处理 GQA/MQA (分组查询注意力/多查询注意力) ---
-    # GQA/MQA 是一种优化，多个查询头共享同一组键/值头，以减少 KV 缓存大小
+    # --- 2. Handle GQA/MQA (Grouped Query Attention/Multi-Query Attention) ---
+    # GQA/MQA is an optimization where multiple query heads share the same set of key/value heads to reduce KV cache size
     if num_heads_k != num_heads:
-        # 确保查询头数量是键/值头数量的整数倍
+        # Ensure the number of query heads is an integer multiple of key/value heads
         assert num_heads % num_heads_k == 0
-        # 使用 einops.repeat 将 K 和 V 的头复制，以匹配 Q 的头数，便于后续计算
+        # Use einops.repeat to replicate K and V heads to match Q heads for subsequent computation
         k = repeat(k, "t h d -> t (h g) d", g = num_heads // num_heads_k)
         v = repeat(v, "t h d -> t (h g) d", g = num_heads // num_heads_k)
 
     output = torch.zeros(total_q, num_heads, head_dim, device=device, dtype=q.dtype)
 
-    # --- 3. 主循环：逐个处理批处理中的序列 ---
+    # --- 3. Main loop: process each sequence in the batch ---
     for batch_idx in range(batch_size):
-        # 使用累积长度来确定当前序列在拼接张量中的起止位置
+        # Use cumulative lengths to determine start and end positions of current sequence in concatenated tensor
         q_start, q_end = cu_seqlens_q[batch_idx].item(), cu_seqlens_q[batch_idx + 1].item()
         k_start, k_end = cu_seqlens_k[batch_idx].item(), cu_seqlens_k[batch_idx + 1].item()
 
-        # 从大张量中切片出当前序列的 q, k, v
+        # Slice current sequence's q, k, v from large tensor
         q_batch = q[q_start:q_end] #(seqlen_q, num_heads, head_dim)
         k_batch = k[k_start:k_end]
         v_batch = v[k_start:k_end]
 
         seqlen_q, seqlen_k = q_batch.shape[0], k_batch.shape[0] # query sequence length, key sequence length
 
-        # --- 4. 计算注意力分数 ---
-        # 使用 einsum 高效计算 Q 和 K 的点积，得到原始注意力分数
-        # "qhd,khd->hqk" 表示:
+        # --- 4. Compute attention scores ---
+        # Use einsum to efficiently compute dot product of Q and K, obtaining raw attention scores
+        # "qhd,khd->hqk" means:
         # qhd: (seqlen_q, num_heads, head_dim)
         # khd: (seqlen_k, num_heads, head_dim)
-        # hqk: 输出 (num_heads, seqlen_q, seqlen_k)
+        # hqk: output (num_heads, seqlen_q, seqlen_k)
         scores = torch.einsum("qhd,khd->hqk", q_batch * softmax_scale, k_batch) # (seqlen_q, seqlen_k)
 
-        # 如果有键填充掩码，则将填充位置的分数设置为负无穷
-        # 这样在 softmax 后，这些位置的概率会变为 0
+        # If there's a key padding mask, set scores at padding positions to negative infinity
+        # This way, after softmax, probabilities at these positions become 0
         if key_padding_mask is not None:
             key_mask = key_padding_mask[batch_idx, :seqlen_k].to(device)
             scores = scores.masked_fill(~key_mask[None, None, :], float('-inf'))
@@ -211,13 +212,7 @@ def block_streaming_attention_ref(
                     scores[head_idx].masked_fill_(causal_mask, float('-inf'))
 
             elif mask_type < 0:
-                # Streaming Attention
-                # 模式 < 0: 流式注意力 (Streaming Attention)
-                # 从 streaming_info 中获取该头的 sink_size 和 local_size
-                sink_size = streaming_info[head_idx * 2].item()
-                local_size = streaming_info[head_idx * 2 + 1].item()
-
-                # 提取当前批次的填充掩码（如果存在）
+                # Extract padding masks for current batch (if they exist)
                 query_mask_batch = None
                 key_mask_batch = None
                 if query_padding_mask is not None:
@@ -239,7 +234,7 @@ def block_streaming_attention_ref(
                 scores[head_idx].masked_fill_(streaming_mask, float('-inf'))
 
             elif mask_type > 0:
-                    # 这里表示 Block Sparse Attention，暂时不考虑
+                    # This indicates Block Sparse Attention, not considered for now
                     pass
 
         attn = torch.softmax(scores, dim=-1).to(v_batch.dtype)
@@ -248,15 +243,15 @@ def block_streaming_attention_ref(
             query_mask = query_padding_mask[batch_idx, :seqlen_q].to(device)
             attn = attn.masked_fill(~query_mask[None, :, None], 0.0)
 
-        # 应用 dropout
+        # Apply dropout
         if p_dropout > 0.0:
             if dropout_mask is not None:
-                # 使用预定义的 dropout mask（用于测试）
+                # Use predefined dropout mask (for testing)
                 attn_drop = attn.masked_fill(
                     ~dropout_mask[batch_idx, :, :seqlen_q, :seqlen_k], 0.0
                 )
             else:
-                # 随机 dropout
+                # Random dropout
                 drop_mask = torch.rand_like(attn) > p_dropout
                 attn_drop = attn.masked_fill(~drop_mask, 0.0)
             dropout_scale = 1.0 / (1.0 - p_dropout)
