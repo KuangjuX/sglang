@@ -19,6 +19,9 @@ class AttentionMask:
     window_size_right: Optional[cutlass.Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
 
+    sink_size: Optional[cutlass.Int32] = None
+    enable_streaming: cutlass.Constexpr[bool] = False
+
     @cute.jit
     def apply_mask(
         self,
@@ -246,3 +249,64 @@ class AttentionMask:
                         if col_idx >= col_limit_right or col_idx < col_limit_left
                         else acc_S[i]
                     )
+
+    def _apply_streaming_mask(
+        self, 
+        acc_S: cute.Tensor,
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        thr_mma: cute.TiledMma,
+        mask_seqlen: cutlass.Constexpr
+    ):
+        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
+        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        tScS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
+        t0ScS_mn = utils.make_acc_tensor_mn_view(thr_mma.get_slice(0).partition_C(cS))
+
+        thr_col_offset = tScS_mn[0][1]
+        seqlenk_col_limit = self.seqlen_k - n_block * self.n_block_size - thr_col_offset
+
+        threads_per_row = thr_mma.tv_layout_C.shape[0][0]
+
+        # TODO(KuangjuX): Packed GQA Support
+
+        causal_row_offset = (
+            1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q - thr_col_offset
+        )
+
+
+        sink_col_limit = self.sink_size - n_block * self.n_block_size - thr_col_offset
+
+        local_row_offset_right = causal_row_offset
+        local_row_offset_left = (
+            causal_row_offset - 1 - self.window_size_left
+            if cutlass.const_expr(self.window_size_left is not None)
+            else -self.seqlen_k
+        )
+
+        for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+            if cutlass.const_expr(self.qhead_per_kvhead_packgqa == 1):
+                row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
+            else:
+                # TODO(KuangjuX): Packed GQA Support
+                
+            col_limit_right = row_idx + local_row_offset_right
+            col_limit_left = row_idx + local_row_offset_left
+
+            if cutlass.const_expr(mask_seqlen):
+                col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+
+            for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+                col_idx = t0ScS_mn[0, c][1]
+
+                should_mask = True
+
+                if col_idx < sink_col_limit:
+                    should_mask = False
+
+                if col_idx >= col_limit_left or col_idx < col_limit_right:
+                    should_mask = False
+
+                if should_mask:
+                    acc_S_mn[r, c] = -cutlass.Float32.inf
+            
