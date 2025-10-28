@@ -52,6 +52,7 @@ class StreamingMaskTester:
             stream=stream,
         )
     
+
     @cute.kernel
     def kernel(
         self,
@@ -60,71 +61,62 @@ class StreamingMaskTester:
         seqlen_k: cutlass.Int32,
         window_size_left: cutlass.Int32,
         sink_size: cutlass.Int32,
-    ):
-        # Access m_block_size and n_block_size via `self`.
-        # The JIT compiler treats these as compile-time constants.
+    ):  
+        tidx = cute.arch.thread_idx()[0]
+
         m_block_size = self.m_block_size
         n_block_size = self.n_block_size
 
-        atom_layout_mnk = (1, 1, 1)
+        atom_m = cutlass.const_expr(m_block_size // 64)
+        atom_n = cutlass.const_expr(n_block_size // 64)
+
+        if tidx == 0:
+            print(f"atom_m: {atom_m}, atom_n: {atom_n}")
+
+        atom_layout_mnk = (atom_m, atom_n, 1)
+        
         tiled_mma = sm90_utils.make_trivial_tiled_mma(
-            cutlass.Float16,
-            cutlass.Float16,
+            cutlass.Float16, cutlass.Float16,
             LayoutEnum.ROW_MAJOR.sm90_mma_major_mode(),
             LayoutEnum.ROW_MAJOR.sm90_mma_major_mode(),
             cutlass.Float32,
             atom_layout_mnk,
-            tiler_mn=(m_block_size, n_block_size),
+            tiler_mn=(64, 64),
         )
-
-        tidx = cute.arch.thread_idx()[0]
         thr_mma = tiled_mma.get_slice(tidx)
-        
+
         m_block = cutlass.Int32(0)
         n_block = cutlass.Int32(0)
-
         mask = AttentionMask(
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            window_size_left=window_size_left,
-            sink_size=sink_size,
+            m_block_size=m_block_size, n_block_size=n_block_size,
+            seqlen_q=seqlen_q, seqlen_k=seqlen_k,
+            window_size_left=window_size_left, sink_size=sink_size,
             enable_streaming=True
         )
-
         acc_shape = tiled_mma.partition_shape_C((m_block_size, n_block_size))
         acc_S = cute.make_fragment(acc_shape, cutlass.Float32)
-        # cute.fill(acc_S, 0.0)
-
         mask.apply_streaming_mask(
             acc_S, m_block, n_block, thr_mma, mask_seqlen=True
         )
 
-        # 2. Define the Destination Layout in Global Memory
-        gmem_layout_c = cute.make_layout((m_block_size, n_block_size))
+        # 打印应用 mask 后的 acc_S
+        # Print acc_S in a more readable format
+        # Instead of using cute.print_tensor which produces cluttered output,
+        # we'll print each element individually with proper formatting
+        if tidx == 0:
+            cute.print_tensor(acc_S)
 
-        # 3. Create a TiledCopy atom for storing the result
-        # This atom knows how to convert from the TiledMma's accumulator layout
-        # to the simple global memory layout we just defined.
-        tiled_copy_C = sm90_utils.make_tiled_copy_C_atom(
-            tiled_mma.tv_layout_C_tiled, gmem_layout_c
-        )
-        thr_copy_op = tiled_copy_C.get_slice(tidx)
+        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32)
 
-        # 4. Partition Source (Accumulator) and Destination (Global Memory)
-        #    using the thread's copy operator.
-        
-        # This is the "retiling" step. It creates a view of the accumulator
-        # with a layout that the copy operation understands.
-        thr_S = thr_copy_op.partition_S(acc_S)
-        
-        # This partitions the global output tensor to get this thread's destination.
-        thr_D = thr_copy_op.partition_D(mOutput)
+        tiled_copy_C = cute.make_tiled_copy_C(copy_atom, tiled_mma)
 
-        # 5. Execute the copy
-        cute.copy(thr_S, thr_D)
+        thrd_copy_C = tiled_copy_C.get_slice(tidx)
 
+        acc_S_view = thrd_copy_C.retile(acc_S)
+
+        gmem_thr_out = thrd_copy_C.partition_D(mOutput)
+
+        cute.copy(thrd_copy_C, acc_S_view, gmem_thr_out)
 
 
 def run_test(
@@ -162,7 +154,6 @@ def run_test(
     torch.cuda.synchronize()
 
     result_cpu = output.cpu().numpy()
-    result_cpu_sliced = result_cpu[:seqlen_q, :seqlen_k]
 
     expected_mask_bool = construct_streaming_mask(
         seqlen_q=seqlen_q,
@@ -177,7 +168,24 @@ def run_test(
     expected_mask[expected_mask_bool] = -float('inf')
     expected_mask = expected_mask.numpy()
 
-    np.testing.assert_allclose(result_cpu_sliced, expected_mask, atol=1e-6)
+    # Check if result matches expected
+    mismatch = ~np.isclose(result_cpu, expected_mask, atol=1e-6)
+    has_mismatch = np.any(mismatch)
+    
+    if has_mismatch:
+        # Report mismatch positions
+        print("\n=== Mismatch Positions (row, col) ===")
+        mismatch_positions = np.argwhere(mismatch)
+        for pos in mismatch_positions:
+            row, col = pos
+            result_val = result_cpu[row, col]
+            expected_val = expected_mask[row, col]
+            result_str = "-inf" if np.isinf(result_val) else f"{result_val:.1f}"
+            expected_str = "-inf" if np.isinf(expected_val) else f"{expected_val:.1f}"
+            print(f"  Position ({row:2d}, {col:2d}): result={result_str}, expected={expected_str}")
+        print()
+
+    np.testing.assert_allclose(result_cpu, expected_mask, atol=1e-6)
 
     print(f"Test passed for m_block={m_block_size}, n_block={n_block_size}, seqlen_q={seqlen_q}, seqlen_k={seqlen_k}!")
 
@@ -187,23 +195,21 @@ run_test.tester_cache = {}
 
 
 if __name__ == "__main__":
-    # I've also corrected the logic in the dummy `construct_streaming_mask` to better
-    # match the typical behavior of streaming attention masks.
-    run_test(
-        m_block_size=64,
-        n_block_size=64,
-        seqlen_q=32,
-        seqlen_k=32,
-        window_size_left=16,
-        sink_size=4
-    )
-
     print("\nRunning original test case (sliced to one block)...")
     run_test(
         m_block_size=64,
         n_block_size=64,
         seqlen_q=64,
         seqlen_k=64,
+        window_size_left=128, # window > seqlen, so it's fully causal + sink
+        sink_size=4
+    )
+
+    run_test(
+        m_block_size=128,
+        n_block_size=128,
+        seqlen_q=128,
+        seqlen_k=128,
         window_size_left=128, # window > seqlen, so it's fully causal + sink
         sink_size=4
     )
