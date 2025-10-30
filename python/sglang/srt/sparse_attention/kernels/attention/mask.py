@@ -307,9 +307,7 @@ class AttentionMask:
                 should_mask = True
 
                 is_in_sink = col_idx < sink_col_limit
-
-                is_causal = col_idx <= col_limit_right
-                
+                is_causal = col_idx <= col_limit_right   
                 is_in_window = col_idx >= col_limit_left
 
                 if is_causal:
@@ -318,5 +316,7 @@ class AttentionMask:
 
                 if should_mask:
                     acc_S_mn[r, c] = -cutlass.Float32.inf
+
+
 
 
