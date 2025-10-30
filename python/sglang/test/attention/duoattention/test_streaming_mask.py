@@ -228,4 +228,3 @@ if __name__ == "__main__":
         window_size_left=128,
         sink_size=4
     )
-    

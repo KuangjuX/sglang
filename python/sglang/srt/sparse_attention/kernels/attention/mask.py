@@ -354,6 +354,3 @@ class AttentionMask:
                 if should_mask:
                     acc_S_mn[r, c] = -cutlass.Float32.inf
 
-
-
-
