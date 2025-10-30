@@ -143,29 +143,14 @@ class BlockInfo:
             # 1. The sink region [0, sink_size), or
             # 2. The local window [n_idx_left, n_idx_max]
             
-            # If sink_size is provided, we need to check if there's a gap between
-            # sink region and local window
             if cutlass.const_expr(self.sink_size is not None):
-                # The sink region ends at sink_size
-                sink_n_block_max = cute.ceil_div(self.sink_size, self.n_block_size)
-                
-                # The local window starts at n_idx_left
-                window_n_block_min = cutlass.max(n_idx_left // self.n_block_size, 0)
-                
-                # If there's no gap between sink and window regions, process from block 0
-                # Otherwise, we might skip some blocks in the middle
-                # However, for simplicity and correctness, we always start from 0
-                # if sink is present, or from window_n_block_min if no sink
-                if sink_n_block_max >= window_n_block_min:
-                    # Sink and window overlap or are adjacent, start from 0
-                    n_block_min = 0
-                else:
-                    # There's a gap, but we still need to process both regions
-                    # For now, start from 0 to handle sink region
-                    # (More optimized version could skip the gap)
-                    n_block_min = 0
+                # When sink is present, we must start from block 0 to include the sink region.
+                # Even if there's a gap between sink and local window, we return a single
+                # continuous range [0, n_block_max). The gap will be masked out by
+                # apply_streaming_mask() which checks each element individually.
+                n_block_min = 0
             else:
-                # No sink, only local window
+                # No sink, only local window - start from the left boundary of the window
                 n_block_min = cutlass.max(n_idx_left // self.n_block_size, 0)
         
         return n_block_min, n_block_max
