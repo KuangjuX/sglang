@@ -12,7 +12,6 @@ from sglang.srt.sparse_attention.kernels.attention.mask import AttentionMask
 from ..test_streaming_attention import construct_streaming_mask
 
 
-
 class StreamingMaskTester:
     """Test class for streaming mask functionality following CuteDSL pattern."""
     
@@ -80,9 +79,6 @@ class StreamingMaskTester:
             atom_layout_mnk,
             tiler_mn=(64, 64),  # Each warpgroup processes 64x64
         )
-
-        total_m = tiled_mma.get_tile_size(0)
-        total_n = tiled_mma.get_tile_size(1)
 
         thr_mma = tiled_mma.get_slice(tidx)
 
