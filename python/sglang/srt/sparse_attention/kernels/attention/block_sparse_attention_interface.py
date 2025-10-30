@@ -333,15 +333,6 @@ class BlockSparseAttnFun(torch.autograd.Function):
             window_size_right=window_size_right
         )
         
-        # Save all tensors and parameters needed for backward pass
-        # These will be retrieved in the backward() method via ctx.saved_tensors
-        ctx.save_for_backward(q, k, v,
-                              out, S_dmask, softmax_lse,
-                              cu_seqlens_q, cu_seqlens_k,
-                              head_mask_type,
-                              streaming_info,
-                              base_blockmask,
-                              rng_state)
         
         # Save scalar parameters as context attributes
         # These define the block structure and attention configuration
@@ -359,9 +350,6 @@ class BlockSparseAttnFun(torch.autograd.Function):
         
         return out
 
-    @staticmethod
-    def backward(ctx, dout):
-        pass
 
 def block_sparse_attn_func(
     q: torch.Tensor,

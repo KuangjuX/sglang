@@ -176,7 +176,6 @@ class AttentionMask:
                         if col_idx >= col_limit_right or col_idx < col_limit_left:
                             acc_S_mn[r, c] = -cutlass.Float32.inf
 
-
     @cute.jit
     def apply_mask_sm100(
         self,
@@ -189,7 +188,9 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
     ) -> None:
-        assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
+        assert not (
+            mask_causal and mask_local
+        ), "mask_causal and mask_local cannot be both True"
         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
         tScS = thr_mma.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
@@ -203,7 +204,9 @@ class AttentionMask:
                         #     acc_S[i] = -cutlass.Float32.inf
                         # For some reason the 2 lines above generate really bad SASS
                         acc_S[i] = (
-                            -cutlass.Float32.inf if tScS_t2r[i][1] >= seqlenk_col_limit else acc_S[i]
+                            -cutlass.Float32.inf
+                            if tScS_t2r[i][1] >= seqlenk_col_limit
+                            else acc_S[i]
                         )
                 else:
                     # Bit manipulation, compiles down to the R2P instruction
@@ -224,12 +227,18 @@ class AttentionMask:
                             # the R2P instruction, so it's slower.
                             # Instead we just move by 24 instead of 32.
                             # if tidx == 0: cute.printf("mask_i_bit = %d, after shift = 0x%x, i = %d, s = %d", mask_i_bit, utils.shr_u32(mask, i), i, s)
-                            acc_S[s * 24 + i] = acc_S[s * 24 + i] if cutlass.Boolean(mask & (1 << i)) else -cutlass.Float32.inf
+                            acc_S[s * 24 + i] = (
+                                acc_S[s * 24 + i]
+                                if cutlass.Boolean(mask & (1 << i))
+                                else -cutlass.Float32.inf
+                            )
                             # This is the equivalent of:
                             # acc_S[s * 24 + i] = acc_S[s * 24 + i] if col_limit_right_s <= i else -cutlass.Float32.inf
                     # if tidx == 0: cute.print_tensor(acc_S)
         else:  # Causal or local
-            causal_row_offset = 1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q
+            causal_row_offset = (
+                1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q
+            )
             row_idx = tScS_t2r[0][0] + m_block * self.m_block_size
             if cutlass.const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
@@ -243,7 +252,9 @@ class AttentionMask:
                 if cutlass.const_expr(False):
                     for i in cutlass.range(ncol, unroll_full=True):
                         acc_S[i] = (
-                            -cutlass.Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
+                            -cutlass.Float32.inf
+                            if tScS_t2r[i][1] >= col_limit_right
+                            else acc_S[i]
                         )
                 else:
                     # Bit manipulation, compiles down to the R2P instruction
@@ -255,7 +266,11 @@ class AttentionMask:
                         # This needs to be range_constexpr, otherwise the compiler can't generate
                         # the R2P instruction
                         for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
-                            acc_S[s * 24 + i] = acc_S[s * 24 + i] if cutlass.Boolean(mask & (1 << i)) else -cutlass.Float32.inf
+                            acc_S[s * 24 + i] = (
+                                acc_S[s * 24 + i]
+                                if cutlass.Boolean(mask & (1 << i))
+                                else -cutlass.Float32.inf
+                            )
                             # This is the equivalent of:
                             # acc_S[s * 24 + i] = acc_S[s * 24 + i] if col_limit_right_s <= i else -cutlass.Float32.inf
             else:
@@ -272,11 +287,15 @@ class AttentionMask:
                 if cutlass.const_expr(self.window_size_right is not None):
                     col_limit_right = row_idx + local_row_offset_right
                     if cutlass.const_expr(mask_seqlen):
-                        col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+                        col_limit_right = cutlass.min(
+                            col_limit_right, seqlenk_col_limit
+                        )
                 else:
                     col_limit_right = self.n_block_size
                 col_limit_left = (
-                    row_idx + local_row_offset_left if cutlass.const_expr(self.window_size_left is not None) else 0
+                    row_idx + local_row_offset_left
+                    if cutlass.const_expr(self.window_size_left is not None)
+                    else 0
                 )
                 # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                 for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
